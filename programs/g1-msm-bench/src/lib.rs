@@ -19,8 +19,6 @@
 #![no_std]
 
 extern crate alloc;
-
-use alloc::{vec, vec::Vec};
 use g1_msm_ref::{alt_bn128_g1_msm_be, naive_msm_be};
 
 /// Custom error codes surfaced as `ProgramError::Custom`.

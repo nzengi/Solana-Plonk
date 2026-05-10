@@ -188,6 +188,51 @@ pub fn run(instruction_data: &[u8]) -> Result<(), u32> {
 /// Builds nothing the default path doesn't also build, so the per-stage
 /// CU readings reflect production code (modulo the cost of the syscalls
 /// themselves, which are uniform).
+/// Lifts the instance-eval reconstruction out of `run_traced` so its
+/// `Vec<Vec<Fr>>` intermediates live in a separate BPF stack frame.
+#[cfg(feature = "stage-trace")]
+#[inline(never)]
+fn reconstruct_instance_evals_helper(
+    vk: &halo2_solana_verifier::plonk::PlonkProtocol,
+    x: ark_bn254::Fr,
+    public_inputs: &[[u8; 32]],
+) -> Result<alloc::vec::Vec<ark_bn254::Fr>, u32> {
+    if vk.num_instance == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    let mut col0 = alloc::vec::Vec::with_capacity(public_inputs.len());
+    for raw in public_inputs {
+        col0.push(halo2_solana_verifier::field::fr_from_bytes_be(raw)
+            .map_err(|_| errors::VERIFIER_ERROR)?);
+    }
+    let mut cols: alloc::vec::Vec<alloc::vec::Vec<ark_bn254::Fr>> = alloc::vec::Vec::new();
+    cols.push(col0);
+    for _ in 1..vk.num_instance {
+        cols.push(alloc::vec::Vec::new());
+    }
+    halo2_solana_verifier::plonk::lagrange::reconstruct_instance_evals(
+        vk.k, vk.omega, x, &vk.instance_queries, &cols,
+    ).map_err(|_| errors::VERIFIER_ERROR)
+}
+
+/// `ω^(n − blinding_factors − 1)` — used by `build_queries`. Lifted out
+/// of `run_traced` for the same stack-frame reason as above.
+#[cfg(feature = "stage-trace")]
+#[inline(never)]
+fn compute_omega_last(k: u32, omega: ark_bn254::Fr, blinding_factors: usize) -> ark_bn254::Fr {
+    let n: u64 = 1u64 << k;
+    let last_pow = n.saturating_sub(blinding_factors as u64 + 1);
+    let mut acc = ark_bn254::Fr::from(1u64);
+    let mut base = omega;
+    let mut exp = last_pow;
+    while exp != 0 {
+        if exp & 1 == 1 { acc *= base; }
+        base = base * base;
+        exp >>= 1;
+    }
+    acc
+}
+
 #[cfg(feature = "stage-trace")]
 fn run_traced(
     vk_bytes: &[u8],
@@ -226,48 +271,19 @@ fn run_traced(
         .map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after lagrange");
 
-    // Reconstruct instance_evals from public_inputs (one-column shorthand
-    // for v1.5 PoC; multi-column instance circuits would need a richer layout).
-    let instance_evals: alloc::vec::Vec<ark_bn254::Fr> = if vk.num_instance == 0 {
-        alloc::vec::Vec::new()
-    } else {
-        let mut col0 = alloc::vec::Vec::with_capacity(public_inputs.len());
-        for raw in &public_inputs {
-            col0.push(halo2_solana_verifier::field::fr_from_bytes_be(raw)
-                .map_err(|_| errors::VERIFIER_ERROR)?);
-        }
-        let mut cols: alloc::vec::Vec<alloc::vec::Vec<ark_bn254::Fr>> = alloc::vec::Vec::new();
-        cols.push(col0);
-        for _ in 1..vk.num_instance {
-            cols.push(alloc::vec::Vec::new());
-        }
-        lagrange::reconstruct_instance_evals(
-            vk.k, vk.omega, ch.x, &vk.instance_queries, &cols,
-        ).map_err(|_| errors::VERIFIER_ERROR)?
-    };
+    let instance_evals = reconstruct_instance_evals_helper(&vk, ch.x, &public_inputs)?;
     let user_challenges: alloc::vec::Vec<ark_bn254::Fr> = alloc::vec::Vec::new();
     let expected_h_eval = v::compute_expected_h_eval(
         &vk, &proof, &ch, &lag, &instance_evals, &user_challenges,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after expected_h_eval");
-    let _ = expected_h_eval; // silence warnings on unused tail values
+    let _ = expected_h_eval;
 
     let h_commit = v::aggregate_h_commitment(&proof.vanishing_h_commits, lag.xn)
         .map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after h_commit");
 
-    // omega_last for build_queries
-    let n: u64 = 1u64 << vk.k;
-    let last_pow = n.saturating_sub(vk.blinding_factors as u64 + 1);
-    let mut acc = ark_bn254::Fr::from(1u64);
-    let mut base = vk.omega;
-    let mut exp = last_pow;
-    while exp != 0 {
-        if exp & 1 == 1 { acc *= base; }
-        base = base * base;
-        exp >>= 1;
-    }
-    let omega_last = acc;
+    let omega_last = compute_omega_last(vk.k, vk.omega, vk.blinding_factors);
     cu("[stage] after omega_last");
 
     let queries = v::build_queries(&vk, &proof, &ch, h_commit, expected_h_eval, vk.omega, omega_last)

@@ -28,7 +28,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use ark_bn254::{Fr, G1Affine, G1Projective};
-use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
+use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{AdditiveGroup, BigInteger, PrimeField, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 

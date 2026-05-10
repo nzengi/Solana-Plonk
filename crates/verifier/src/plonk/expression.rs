@@ -40,7 +40,6 @@
 
 use alloc::vec::Vec;
 use ark_bn254::Fr;
-use ark_ff::AdditiveGroup;
 
 use crate::{field::fr_from_bytes_be, Error};
 

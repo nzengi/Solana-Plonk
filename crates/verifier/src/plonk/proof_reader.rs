@@ -212,8 +212,10 @@ pub fn expected_proof_size(vk: &PlonkProtocol) -> usize {
 mod tests {
     use super::*;
     use crate::curve::G1;
+    #[allow(unused_imports)]
     use crate::field::fr_to_bytes_be;
 
+    #[allow(dead_code)]
     fn zero_vk(num_advice: usize, num_advice_queries: usize, cs_degree: usize) -> PlonkProtocol {
         use ark_ff::Field;
         PlonkProtocol {
@@ -233,6 +235,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn synth_g1(tag: u8) -> [u8; 64] {
         // Identity if tag=0; otherwise (tag, tag+1) which is on-curve only if
         // we're lucky. For pure byte-level read tests we don't need on-curve
@@ -242,6 +245,7 @@ mod tests {
         b
     }
 
+    #[allow(dead_code)]
     fn synth_scalar(tag: u8) -> [u8; 32] {
         let mut b = [0u8; 32];
         b[31] = tag; // small enough to be in Fr range
