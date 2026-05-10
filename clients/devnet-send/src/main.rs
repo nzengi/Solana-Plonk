@@ -56,15 +56,49 @@ const KEYPAIR_PATH: &str = "/home/nzengi/.config/solana/id.json";
 const VERIFY_TAG: u8 = 0x00;
 const LOAD_TAG:   u8 = 0x01;
 
+/// Translate the Fibonacci circuit's `GLDN0002` blob (which is what
+/// `gen-fib-proof --write-golden` emits) into the verifier-program's
+/// `GLDN0001` instruction-data layout. The byte content is the same
+/// downstream of the magic — we only swap the 8-byte prefix.
+fn repackage_fib_golden_to_gldn0001(raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.len() < 8 || &raw[..8] != b"GLDN0002" {
+        anyhow::bail!("expected GLDN0002 magic in Fibonacci golden file");
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    out.extend_from_slice(b"GLDN0001");
+    out.extend_from_slice(&raw[8..]);
+    Ok(out)
+}
+
 fn main() -> Result<()> {
     let program_id: Pubkey = PROGRAM_ID_STR.parse()?;
 
+    // Mode selection: default = StandardPlonk; `--fib` switches to Fibonacci.
+    let fib_mode = std::env::args().any(|a| a == "--fib");
+
     // Load golden vector.
     let mut golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    golden.push("../../circuits/standard-plonk/tests/golden_v1.bin");
-    let payload = std::fs::read(&golden)?;
+    if fib_mode {
+        golden.push("../../circuits/fibonacci/tests/golden_v15_fib.bin");
+    } else {
+        golden.push("../../circuits/standard-plonk/tests/golden_v1.bin");
+    }
+    let raw = std::fs::read(&golden)?;
+
+    // The Fibonacci golden file uses magic `GLDN0002` and carries a
+    // `[n_pi: u32 LE | pi: 32B × n_pi]` suffix after the kzg fields.
+    // The verifier-program's `parse_instruction` accepts the same suffix
+    // shape under magic `GLDN0001`, so we transcode if needed.
+    let payload = if fib_mode {
+        repackage_fib_golden_to_gldn0001(&raw)?
+    } else {
+        raw
+    };
     let payload_len = payload.len();
-    eprintln!("[1/?] loaded golden vector: {payload_len} B from {golden:?}");
+    eprintln!(
+        "[1/?] loaded golden vector ({}): {payload_len} B from {golden:?}",
+        if fib_mode { "Fibonacci, GLDN0002" } else { "StandardPlonk, GLDN0001" },
+    );
 
     let client = RpcClient::new_with_commitment(DEVNET_URL, CommitmentConfig::confirmed());
     let payer = read_keypair_file(KEYPAIR_PATH)

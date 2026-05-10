@@ -113,6 +113,41 @@ Arkworks `Fr::inverse()` is constant-time Montgomery extended-Euclidean — pure
 
 ## 3a. v1.5 — generic gate-AST evaluator + multi-circuit support
 
+### Per-stage CU breakdown comparison
+
+| Stage                       | StandardPlonk |  Fibonacci  | Δ |
+|-----------------------------|--------------:|------------:|--:|
+| entry overhead              |           420 |         620 | +48% |
+| parse_vk                    |        11,610 |      11,205 | ~0 |
+| read_proof                  |       258,636 |     194,364 | **−25%** |
+| lagrange::evaluate_lagrange |       533,710 |     531,730 | ~0 |
+| compute_expected_h_eval     |       157,993 |     260,960 | **+65%** |
+| h_commit                    |        15,726 |      15,716 | ~0 |
+| omega_last                  |        11,540 |      11,540 | 0 |
+| build_queries               |        24,557 |      26,818 | +9% |
+| **shplonk::verify_opening** |   **1,666,984** | **1,183,498** | **−29%** |
+| pairing                     |        49,546 |      49,546 | 0 |
+| **TOTAL**                   |   **2,730,735** | **2,285,954** | **−16%** |
+
+Two circuits, same `.so`. The headline:
+- Fibonacci's SHPLONK is **29% lighter** (1 advice column vs 3 → fewer
+  rotation-set commitments to fold).
+- Fibonacci's `compute_expected_h_eval` is **65% heavier** because its
+  gate AST has rotation::next + Rotation(2) advice queries plus a wider
+  permutation argument.
+- Net: Fibonacci is **16% cheaper** end-to-end. Same SIMD case applies —
+  SHPLONK is still the dominant slice (52% for Fibonacci, 61% for
+  StandardPlonk) and the `alt_bn128_g1_msm` proposal still moves the
+  needle most.
+
+### v1.5 vs v1
+v1 totals 2,710,424 CU (StandardPlonk hard-coded gate). v1.5 same circuit
+totals 2,730,735 CU = **+0.75%** AST evaluator overhead. Almost all of
+the delta lives in `build_queries` (v1: 7,229 → v1.5: 24,557, +17,328) —
+per-query metadata processing + `rotate_point` calls. Acceptable.
+
+
+
 v1.5 replaces v1's hard-coded StandardPlonk gate with a stack-based RPN
 bytecode evaluator (`crates/verifier/src/plonk/expression.rs`). The VK
 format gains gate AST bytecode + per-query column metadata + permuted
