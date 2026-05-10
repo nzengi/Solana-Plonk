@@ -3,17 +3,21 @@
 //! `PlonkProof` and the `Challenges` consumed by gate / permutation / KZG
 //! sub-arguments.
 //!
-//! Read order matches PSE-Halo2's `verify_proof` exactly (single-proof,
-//! no-lookup, no-shuffle path):
+//! Read order matches PSE-Halo2's `verify_proof` exactly. v2.0 adds
+//! lookup/shuffle commits + evals and per-phase user challenges.
 //!
 //! ```text
 //!  ── absorb VK transcript_repr (already done at Keccak256Transcript::new)
 //!  ── absorb public inputs                       (caller provides instances)
 //!  R: advice commits                              [num_advice]   G1
+//!  S: user challenges                             [num_challenges]   (v2.0)
 //!  S: theta
+//!  R: per-lookup permuted_input + permuted_table  [2 · num_lookups] G1   (v2.0)
 //!  S: beta
 //!  S: gamma
 //!  R: permutation product commits                 [num_perm_chunks] G1
+//!  R: per-lookup product commits                  [num_lookups] G1       (v2.0)
+//!  R: per-shuffle product commits                 [num_shuffles] G1      (v2.0)
 //!  R: random_poly commit                          [1]            G1
 //!  S: y
 //!  R: vanishing h pieces                          [cs_degree-1]  G1
@@ -23,7 +27,11 @@
 //!  R: random_poly eval                            [1] Fr
 //!  R: permutation common evals                    [num_perm_columns] Fr
 //!  R: permutation product evals                   [num_perm_chunks*3] Fr (z, zω, z_last)
+//!  R: per-lookup 5 evals                          [5 · num_lookups] Fr   (v2.0)
+//!  R: per-shuffle 2 evals                         [2 · num_shuffles] Fr  (v2.0)
+//!  S: shplonk_y, shplonk_v
 //!  R: opening proof W                             [1] G1
+//!  S: shplonk_u
 //!  R: opening proof W'                            [1] G1
 //! ```
 //!
@@ -34,7 +42,7 @@ use alloc::vec::Vec;
 use ark_bn254::Fr;
 
 use crate::{
-    plonk::{Challenges, PlonkProof, PlonkProtocol},
+    plonk::{Challenges, LookupEvals, PlonkProof, PlonkProtocol},
     transcript::Keccak256Transcript,
     Error,
 };
@@ -62,14 +70,40 @@ pub fn read_proof(
     // (1) advice commits ───────────────────────────────────────────────────
     let advice_commits = read_g1s(transcript, proof_bytes, &mut cur, vk.num_advice)?;
 
-    // squeeze theta, beta, gamma ───────────────────────────────────────────
+    // (1.5) v2.0: user-defined phase challenges. Halo2 squeezes one challenge
+    // per `cs.num_challenges()` AFTER the matching phase's advice commits and
+    // BEFORE theta. v1.5 collapsed all advice into one batch (single-phase
+    // assumption) — we keep that here, so all user challenges are squeezed in
+    // one block. Multi-phase splitting is task #46.
+    let mut user_challenges = Vec::with_capacity(vk.num_challenges);
+    for _ in 0..vk.num_challenges {
+        user_challenges.push(transcript.squeeze_challenge());
+    }
+
+    // squeeze theta ────────────────────────────────────────────────────────
     let theta = transcript.squeeze_challenge();
+
+    // (1.6) v2.0: per-lookup permuted_input_commitment + permuted_table_commitment
+    let mut lookup_permuted_input_commits = Vec::with_capacity(vk.num_lookups());
+    let mut lookup_permuted_table_commits = Vec::with_capacity(vk.num_lookups());
+    for _ in 0..vk.num_lookups() {
+        lookup_permuted_input_commits.push(transcript.read_g1(proof_bytes, &mut cur)?);
+        lookup_permuted_table_commits.push(transcript.read_g1(proof_bytes, &mut cur)?);
+    }
+
+    // squeeze beta, gamma ──────────────────────────────────────────────────
     let beta  = transcript.squeeze_challenge();
     let gamma = transcript.squeeze_challenge();
 
     // (2) permutation product commits ──────────────────────────────────────
     let permutation_product_commits =
         read_g1s(transcript, proof_bytes, &mut cur, vk.num_perm_chunks)?;
+
+    // (2.5) v2.0: per-lookup grand-product commits + per-shuffle product commits
+    let lookup_product_commits =
+        read_g1s(transcript, proof_bytes, &mut cur, vk.num_lookups())?;
+    let shuffle_product_commits =
+        read_g1s(transcript, proof_bytes, &mut cur, vk.num_shuffles())?;
 
     // (3) random_poly commit ───────────────────────────────────────────────
     let random_poly_commit = transcript.read_g1(proof_bytes, &mut cur)?;
@@ -115,6 +149,34 @@ pub fn read_proof(
         permutation_product_evals.push((z, z_omega, z_last));
     }
 
+    // (9.5) v2.0: per-lookup 5 evals — exact transcript order matters.
+    // halo2's `lookup::Committed::evaluate` reads in this sequence:
+    //   product_eval, product_next_eval, permuted_input_eval,
+    //   permuted_input_inv_eval, permuted_table_eval
+    let mut lookup_evals = Vec::with_capacity(vk.num_lookups());
+    for _ in 0..vk.num_lookups() {
+        let product_eval            = transcript.read_scalar(proof_bytes, &mut cur)?;
+        let product_next_eval       = transcript.read_scalar(proof_bytes, &mut cur)?;
+        let permuted_input_eval     = transcript.read_scalar(proof_bytes, &mut cur)?;
+        let permuted_input_inv_eval = transcript.read_scalar(proof_bytes, &mut cur)?;
+        let permuted_table_eval     = transcript.read_scalar(proof_bytes, &mut cur)?;
+        lookup_evals.push(LookupEvals {
+            product_eval,
+            product_next_eval,
+            permuted_input_eval,
+            permuted_input_inv_eval,
+            permuted_table_eval,
+        });
+    }
+
+    // (9.6) v2.0: per-shuffle 2 evals — (product_eval, product_next_eval).
+    let mut shuffle_evals = Vec::with_capacity(vk.num_shuffles());
+    for _ in 0..vk.num_shuffles() {
+        let product_eval      = transcript.read_scalar(proof_bytes, &mut cur)?;
+        let product_next_eval = transcript.read_scalar(proof_bytes, &mut cur)?;
+        shuffle_evals.push((product_eval, product_next_eval));
+    }
+
     // ── SHPLONK opening protocol ───────────────────────────────────────────
     // Order matches halo2_proofs::poly::kzg::multiopen::shplonk::verifier:
     //   squeeze y  → squeeze v  → read h1  → squeeze u  → read h2
@@ -139,10 +201,19 @@ pub fn read_proof(
             random_poly_eval,
             permutation_common_evals,
             permutation_product_evals,
+            lookup_permuted_input_commits,
+            lookup_permuted_table_commits,
+            lookup_product_commits,
+            lookup_evals,
+            shuffle_product_commits,
+            shuffle_evals,
             opening_proof_w,
             opening_proof_w_prime,
         },
-        Challenges { theta, beta, gamma, y, x, shplonk_y, shplonk_v, shplonk_u },
+        Challenges {
+            theta, beta, gamma, y, x, shplonk_y, shplonk_v, shplonk_u,
+            user_challenges,
+        },
     ))
 }
 
@@ -186,7 +257,10 @@ pub fn expected_proof_size(vk: &PlonkProtocol) -> usize {
 
     let g1_count =
         vk.num_advice                       // advice commits
+      + 2 * vk.num_lookups()                // v2.0: permuted_input + permuted_table per lookup
       + vk.num_perm_chunks                  // perm product commits
+      + vk.num_lookups()                    // v2.0: 1 product commit per lookup
+      + vk.num_shuffles()                   // v2.0: 1 product commit per shuffle
       + 1                                   // random_poly commit
       + vk.cs_degree.saturating_sub(1)      // vanishing h pieces
       + 2;                                  // opening proof W, W'
@@ -203,7 +277,9 @@ pub fn expected_proof_size(vk: &PlonkProtocol) -> usize {
       + vk.num_fixed_queries
       + 1                                   // random_poly eval
       + vk.num_perm_columns()
-      + perm_prod_evals;
+      + perm_prod_evals
+      + 5 * vk.num_lookups()                // v2.0: 5 evals per lookup
+      + 2 * vk.num_shuffles();              // v2.0: 2 evals per shuffle
 
     g1_count * G1_LEN + fr_count * FR_LEN
 }

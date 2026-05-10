@@ -303,4 +303,48 @@ mod tests {
         let bc = vec![0xEF];
         assert!(matches!(evaluate(&bc, &empty_ctx()), Err(Error::InvalidGateBytecode)));
     }
+
+    /// OP_CHALLENGE pushes user_challenges[idx] onto the stack — verifies
+    /// the v2.0 user-defined phase challenges path. Single-phase circuits
+    /// pass `proof.user_challenges` populated by `read_proof` (squeezed
+    /// after advice batch, before theta).
+    #[test]
+    fn op_challenge_pushes_user_challenge() {
+        // bc: CHALLENGE 0  (push user_challenges[0])
+        let bc = vec![OP_CHALLENGE, 0u8];
+        let ctx = EvalContext {
+            advice_evals:    &[],
+            fixed_evals:     &[],
+            instance_evals:  &[],
+            user_challenges: &[Fr::from(13u64), Fr::from(17u64)],
+        };
+        assert_eq!(evaluate(&bc, &ctx).unwrap(), Fr::from(13u64));
+    }
+
+    /// OP_CHALLENGE with idx 1 picks the second challenge — confirms
+    /// indexing is correct for >1 user challenge.
+    #[test]
+    fn op_challenge_indexed() {
+        let bc = vec![OP_CHALLENGE, 1u8];
+        let ctx = EvalContext {
+            advice_evals:    &[],
+            fixed_evals:     &[],
+            instance_evals:  &[],
+            user_challenges: &[Fr::from(13u64), Fr::from(17u64)],
+        };
+        assert_eq!(evaluate(&bc, &ctx).unwrap(), Fr::from(17u64));
+    }
+
+    /// Out-of-range challenge index is rejected as invalid bytecode.
+    #[test]
+    fn op_challenge_oob_rejects() {
+        let bc = vec![OP_CHALLENGE, 5u8];
+        let ctx = EvalContext {
+            advice_evals:    &[],
+            fixed_evals:     &[],
+            instance_evals:  &[],
+            user_challenges: &[Fr::from(13u64)],
+        };
+        assert!(matches!(evaluate(&bc, &ctx), Err(Error::InvalidGateBytecode)));
+    }
 }

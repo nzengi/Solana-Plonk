@@ -230,6 +230,7 @@ mod tests {
             shplonk_y: Fr::ONE,
             shplonk_v: Fr::ONE,
             shplonk_u: Fr::ONE,
+            user_challenges: Vec::new(),
         }
     }
 
@@ -245,6 +246,12 @@ mod tests {
             permutation_common_evals: (0..num_perm_cols)
                 .map(|i| Fr::from((i as u64) * 7 + 3)).collect(),
             permutation_product_evals: alloc::vec![(Fr::from(31u64), Fr::from(37u64), Fr::from(41u64))],
+            lookup_permuted_input_commits: Vec::new(),
+            lookup_permuted_table_commits: Vec::new(),
+            lookup_product_commits:        Vec::new(),
+            lookup_evals:                  Vec::new(),
+            shuffle_product_commits:       Vec::new(),
+            shuffle_evals:                 Vec::new(),
             opening_proof_w: G1::IDENTITY,
             opening_proof_w_prime: G1::IDENTITY,
         }

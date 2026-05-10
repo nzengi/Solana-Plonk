@@ -8,8 +8,8 @@ use halo2curves::group::prime::PrimeCurveAffine;
 /// Magic bytes prefixed to every on-chain VK blob.
 /// Tied to the verifier-router pattern — bumping the magic forces an explicit
 /// VK migration if a soundness bug is ever found in the verifier.
-pub const VK_MAGIC: &[u8; 8] = b"H2SV0002";
-pub const VK_VERSION: u32 = 2;
+pub const VK_MAGIC: &[u8; 8] = b"H2SV0003";
+pub const VK_VERSION: u32 = 3;
 
 /// Convert a halo2curves bn256 `Fr` (scalar) to canonical 32-byte big-endian.
 /// `to_repr()` returns canonical (post-Montgomery) little-endian bytes.

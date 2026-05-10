@@ -7,8 +7,10 @@
 
 pub mod expression;
 pub mod lagrange;
+pub mod lookup;
 pub mod permutation;
 pub mod proof_reader;
+pub mod shuffle;
 pub mod verifier;
 
 use alloc::vec::Vec;
@@ -59,16 +61,50 @@ pub struct PlonkProtocol {
     /// indexes into the matching `*_queries` list above.
     pub permuted_columns: Vec<(u8, u32)>,
 
+    /// v2.0: lookup arguments. Each entry has its input + table expression
+    /// bytecode lists; the verifier theta-folds them into a single Fr at
+    /// runtime. Empty for circuits without lookups.
+    pub lookups: Vec<LookupArgument>,
+
+    /// v2.0: shuffle arguments. Simpler than lookups (single product commit
+    /// per shuffle, no permuted-input/table machinery).
+    pub shuffles: Vec<ShuffleArgument>,
+
     /// Pre-computed Blake2b("Halo2-Verify-Key" || …) → `transcript_repr`.
     /// Computed off-chain by the VK compiler so the on-chain verifier never
     /// has to run Blake2b.
     pub transcript_repr: [u8; 32],
 }
 
+/// One lookup argument's spec — pulled from `vk.cs.lookups()` and encoded
+/// into VK bytes. Each expression is RPN bytecode for the expression
+/// evaluator (same surface as gate ASTs).
+#[derive(Clone, Debug, Default)]
+pub struct LookupArgument {
+    /// Input expressions (one per matched column). Theta-folded at runtime
+    /// into `input_compressed`.
+    pub input_expressions: Vec<Vec<u8>>,
+    /// Table expressions (must have the same count as `input_expressions`).
+    pub table_expressions: Vec<Vec<u8>>,
+}
+
+/// One shuffle argument's spec. Halo2's shuffle is a permutation argument
+/// over a sub-set; the verifier reads one product commit per shuffle and
+/// emits a small expression set (handled in v2.0 task #45).
+#[derive(Clone, Debug, Default)]
+pub struct ShuffleArgument {
+    /// Input expressions for the shuffled side.
+    pub input_expressions: Vec<Vec<u8>>,
+    /// Reference expressions (the side the input must be a shuffle of).
+    pub shuffle_expressions: Vec<Vec<u8>>,
+}
+
 impl PlonkProtocol {
     pub fn num_perm_columns(&self) -> usize {
         self.permutation_commitments.len()
     }
+    pub fn num_lookups(&self) -> usize { self.lookups.len() }
+    pub fn num_shuffles(&self) -> usize { self.shuffles.len() }
 }
 
 #[cfg(any(test, feature = "std"))]
@@ -96,6 +132,8 @@ impl Default for PlonkProtocol {
             instance_queries: Vec::new(),
             gates: Vec::new(),
             permuted_columns: Vec::new(),
+            lookups: Vec::new(),
+            shuffles: Vec::new(),
             transcript_repr: [0u8; 32],
         }
     }
@@ -125,19 +163,49 @@ pub struct PlonkProof {
     /// (9) Permutation product evaluations (z, z_omega, z_last) per chunk —
     /// `num_perm_chunks` triples.
     pub permutation_product_evals: Vec<(Fr, Fr, Fr)>,
+
+    // ── v2.0 lookup additions ────────────────────────────────────────────
+    /// Per-lookup permuted-input commitments. Length = `num_lookups`.
+    pub lookup_permuted_input_commits: Vec<G1>,
+    /// Per-lookup permuted-table commitments. Length = `num_lookups`.
+    pub lookup_permuted_table_commits: Vec<G1>,
+    /// Per-lookup grand-product commitments. Length = `num_lookups`.
+    pub lookup_product_commits: Vec<G1>,
+    /// Per-lookup five evaluations:
+    /// `(product_eval, product_next_eval, permuted_input_eval,
+    ///   permuted_input_inv_eval, permuted_table_eval)`
+    pub lookup_evals: Vec<LookupEvals>,
+
+    // ── v2.0 shuffle additions ──────────────────────────────────────────
+    /// Per-shuffle product commitments. Length = `num_shuffles`.
+    pub shuffle_product_commits: Vec<G1>,
+    /// Per-shuffle two evaluations: `(product_eval, product_next_eval)`.
+    pub shuffle_evals: Vec<(Fr, Fr)>,
+
     /// (10) SHPLONK opening proof — two G1 points.
     pub opening_proof_w: G1,
     pub opening_proof_w_prime: G1,
 }
 
+/// Five `Fr` values halo2 emits per lookup, in this exact transcript order.
+#[derive(Clone, Copy, Debug)]
+pub struct LookupEvals {
+    pub product_eval: Fr,
+    pub product_next_eval: Fr,
+    pub permuted_input_eval: Fr,
+    pub permuted_input_inv_eval: Fr,
+    pub permuted_table_eval: Fr,
+}
+
 /// Fiat–Shamir challenges derived during proof reading.
 ///
 /// Halo2's main protocol challenges (theta/beta/gamma/y/x) plus the SHPLONK
-/// opening challenges (shplonk_y for combining rotation-set polynomials,
-/// shplonk_v for combining rotation sets, shplonk_u for the evaluation point).
-#[derive(Clone, Copy, Debug)]
+/// opening challenges (shplonk_y / shplonk_v / shplonk_u). v2.0 also stores
+/// the user-defined per-phase challenges that gates may reference via the
+/// RPN bytecode `OP_CHALLENGE` opcode.
+#[derive(Clone, Debug)]
 pub struct Challenges {
-    pub theta: Fr,   // unused for no-lookup circuits but always squeezed
+    pub theta: Fr,   // squeezed always (compress lookup columns); unused if no lookups
     pub beta:  Fr,
     pub gamma: Fr,
     pub y:     Fr,
@@ -148,4 +216,7 @@ pub struct Challenges {
     pub shplonk_v: Fr,
     /// SHPLONK opening's "u" — the evaluation point of the linearization poly.
     pub shplonk_u: Fr,
+    /// User-defined phase challenges, one per `vk.cs.num_challenges`. Empty
+    /// for circuits with no challenge_phase declarations.
+    pub user_challenges: Vec<Fr>,
 }

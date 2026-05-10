@@ -1,12 +1,12 @@
-//! On-chain `VerifyingKey` byte format (v1.5).
+//! On-chain `VerifyingKey` byte format (v2.0).
 //!
 //! Layout (packed binary). BN254 field elements are 32-byte big-endian
 //! (matches `alt_bn128_*_be`); metadata fields are little-endian (matches
 //! Solana convention).
 //!
 //! ```text
-//! magic                : [u8; 8]    = b"H2SV0002"
-//! version              : u32 LE     = 2
+//! magic                : [u8; 8]    = b"H2SV0003"
+//! version              : u32 LE     = 3
 //!
 //! ---- circuit metadata ----
 //! k                    : u32 LE     // log2 of circuit rows
@@ -47,16 +47,36 @@
 //! n_perm_columns       : u32 LE     // must equal n_perm
 //! permuted_columns[]   : (col_type: u8, query_index: u32 LE) × n_perm_columns
 //!                        // col_type ∈ {0=advice, 1=fixed, 2=instance}
+//!
+//! ---- v2.0 lookup arguments ----
+//! num_lookups          : u32 LE
+//! for each lookup:
+//!     num_input_expressions : u32 LE
+//!     for each input expr:
+//!         bytecode_len      : u32 LE
+//!         bytecode          : [u8; bytecode_len]   // RPN, see plonk::expression
+//!     num_table_expressions : u32 LE   // must equal num_input_expressions
+//!     for each table expr:
+//!         bytecode_len      : u32 LE
+//!         bytecode          : [u8; bytecode_len]
+//!
+//! ---- v2.0 shuffle arguments ----
+//! num_shuffles         : u32 LE
+//! for each shuffle:
+//!     num_input_expressions   : u32 LE
+//!     <input bytecodes>
+//!     num_shuffle_expressions : u32 LE   // must equal num_input_expressions
+//!     <shuffle bytecodes>
 //! ```
 //!
 //! See `halo2-solana-vk-host::compile::compile_vk` for the matching encoder.
 
 use alloc::vec::Vec;
 
-use crate::{curve::G1, plonk::PlonkProtocol, Error};
+use crate::{curve::G1, plonk::{LookupArgument, PlonkProtocol, ShuffleArgument}, Error};
 
-pub const VK_MAGIC: &[u8; 8] = b"H2SV0002";
-pub const VK_VERSION: u32 = 2;
+pub const VK_MAGIC: &[u8; 8] = b"H2SV0003";
+pub const VK_VERSION: u32 = 3;
 
 pub fn parse_vk(bytes: &[u8]) -> Result<PlonkProtocol, Error> {
     let mut r = Reader::new(bytes);
@@ -132,6 +152,51 @@ pub fn parse_vk(bytes: &[u8]) -> Result<PlonkProtocol, Error> {
         permuted_columns.push((col_type, query_index));
     }
 
+    // ── v2.0 lookup arguments ──────────────────────────────────────────
+    let num_lookups = r.read_u32_le()? as usize;
+    let mut lookups: Vec<LookupArgument> = Vec::with_capacity(num_lookups);
+    for _ in 0..num_lookups {
+        let input_count = r.read_u32_le()? as usize;
+        let mut input_expressions: Vec<Vec<u8>> = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            let bc_len = r.read_u32_le()? as usize;
+            input_expressions.push(r.read_bytes(bc_len)?);
+        }
+        let table_count = r.read_u32_le()? as usize;
+        if table_count != input_count {
+            // Halo2 enforces matched input/table column count.
+            return Err(Error::InvalidVkEncoding);
+        }
+        let mut table_expressions: Vec<Vec<u8>> = Vec::with_capacity(table_count);
+        for _ in 0..table_count {
+            let bc_len = r.read_u32_le()? as usize;
+            table_expressions.push(r.read_bytes(bc_len)?);
+        }
+        lookups.push(LookupArgument { input_expressions, table_expressions });
+    }
+
+    // ── v2.0 shuffle arguments ─────────────────────────────────────────
+    let num_shuffles = r.read_u32_le()? as usize;
+    let mut shuffles: Vec<ShuffleArgument> = Vec::with_capacity(num_shuffles);
+    for _ in 0..num_shuffles {
+        let input_count = r.read_u32_le()? as usize;
+        let mut input_expressions: Vec<Vec<u8>> = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            let bc_len = r.read_u32_le()? as usize;
+            input_expressions.push(r.read_bytes(bc_len)?);
+        }
+        let shuf_count = r.read_u32_le()? as usize;
+        if shuf_count != input_count {
+            return Err(Error::InvalidVkEncoding);
+        }
+        let mut shuffle_expressions: Vec<Vec<u8>> = Vec::with_capacity(shuf_count);
+        for _ in 0..shuf_count {
+            let bc_len = r.read_u32_le()? as usize;
+            shuffle_expressions.push(r.read_bytes(bc_len)?);
+        }
+        shuffles.push(ShuffleArgument { input_expressions, shuffle_expressions });
+    }
+
     if !r.is_empty() {
         return Err(Error::InvalidVkEncoding);
     }
@@ -156,6 +221,8 @@ pub fn parse_vk(bytes: &[u8]) -> Result<PlonkProtocol, Error> {
         instance_queries,
         gates,
         permuted_columns,
+        lookups,
+        shuffles,
         transcript_repr,
     })
 }
@@ -245,6 +312,9 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes());          // n_fixed
         buf.extend_from_slice(&0u32.to_le_bytes());          // n_perm
         buf.extend_from_slice(&0u32.to_le_bytes());          // n_perm_columns
+        // v2.0 footers
+        buf.extend_from_slice(&0u32.to_le_bytes());          // num_lookups
+        buf.extend_from_slice(&0u32.to_le_bytes());          // num_shuffles
         buf
     }
 
@@ -291,10 +361,11 @@ mod tests {
     #[test]
     fn rejects_perm_count_mismatch() {
         let mut buf = synth_empty_vk_bytes();
-        // last 4 bytes are n_perm_columns. Replace with 1 instead of 0,
-        // without adding a permuted_columns entry → parser must fail.
-        let len = buf.len();
-        buf[len - 4..].copy_from_slice(&1u32.to_le_bytes());
+        // n_perm_columns is the last u32 BEFORE the v2.0 footers
+        // (num_lookups + num_shuffles = 8 trailing bytes). Bump it to 1
+        // without supplying an entry → parser must reject.
+        let off = buf.len() - 12;
+        buf[off..off + 4].copy_from_slice(&1u32.to_le_bytes());
         assert!(matches!(parse_vk(&buf), Err(Error::InvalidVkEncoding)));
     }
 }

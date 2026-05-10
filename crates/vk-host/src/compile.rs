@@ -1,9 +1,13 @@
-//! halo2 `VerifyingKey<G1Affine>`  →  on-chain `PlonkProtocol` byte stream (v1.5).
+//! halo2 `VerifyingKey<G1Affine>`  →  on-chain `PlonkProtocol` byte stream (v2.0 WIP).
 //!
-//! v1.5 emits the extended VK format defined in
+//! v2.0 emits the extended VK format defined in
 //! `halo2_solana_verifier::vk` — gate AST bytecode + query metadata +
-//! permuted column type tags. Lookups are unsupported in this version
-//! (rejected at compile time).
+//! permuted column type tags + (task #40) lookup/shuffle expression specs.
+//!
+//! For circuits with `cs.lookups()` / `cs.shuffles()` non-empty, the
+//! corresponding expression encoder lands in task #40; until then the
+//! encoder still rejects them. Zero-length lookup/shuffle blocks are
+//! emitted unconditionally so the v2.0 parser footer is always present.
 
 use halo2_proofs::halo2curves::bn256::{Fr, G1Affine};
 use halo2_proofs::plonk::VerifyingKey;
@@ -23,9 +27,9 @@ pub enum Error {
     Encode(&'static str),
     #[error("gate expression encoding failed: {0:?}")]
     GateEncode(EncodeError),
-    #[error("v1.5 does not support lookup arguments — drop them or wait for v2")]
+    #[error("v2.0 lookup expression encoding is task #40 — drop lookups for now")]
     LookupsUnsupported,
-    #[error("v1.5 does not support shuffle arguments — drop them or wait for v2")]
+    #[error("v2.0 shuffle expression encoding is task #45 — drop shuffles for now")]
     ShufflesUnsupported,
     #[error("permuted column not found in any *_queries list at Rotation::cur — \
              this VK has copy constraints on a column without a rotation-0 query")]
@@ -48,11 +52,22 @@ pub fn compile_vk(
     let cs = vk.cs();
 
     // ── reject unsupported features early ────────────────────────────────
-    if !cs.lookups().is_empty() {
-        return Err(Error::LookupsUnsupported);
+    // v2.0: lookups + shuffles are now encoded below.
+    // v2.0 Fiat–Shamir wire is single-phase: all advice commits are read
+    // in one batch, then all user challenges squeezed in one batch, then
+    // theta. Multi-phase circuits interleave advice reads with phase
+    // challenge squeezes — the wire layout differs and is deferred to v2.1.
+    let phases = cs.advice_column_phase();
+    if phases.iter().any(|&p| p != 0) {
+        return Err(Error::Compile(
+            "v2.0 supports single-phase circuits only — multi-phase advice columns deferred to v2.1",
+        ));
     }
-    if !cs.shuffles().is_empty() {
-        return Err(Error::ShufflesUnsupported);
+    let challenge_phases = cs.challenge_phase();
+    if challenge_phases.iter().any(|&p| p != 0) {
+        return Err(Error::Compile(
+            "v2.0 supports single-phase challenges only — multi-phase challenges deferred to v2.1",
+        ));
     }
 
     let num_instance         = cs.num_instance_columns();
@@ -86,6 +101,45 @@ pub fn compile_vk(
             polys.push(encode_expression(poly, cs)?);
         }
         gate_blobs.push(polys);
+    }
+
+    // ── pre-encode lookup expression bytecodes ──────────────────────────
+    // Each lookup yields two same-length expression vectors (input + table).
+    // The 2.0 verifier theta-folds them at runtime to compute
+    // `input_compressed` / `table_compressed`.
+    let mut lookup_blobs: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)> =
+        Vec::with_capacity(cs.lookups().len());
+    for lookup in cs.lookups() {
+        let inputs  = lookup.input_expressions();
+        let tables  = lookup.table_expressions();
+        if inputs.len() != tables.len() {
+            return Err(Error::Compile(
+                "lookup has mismatched input/table expression counts",
+            ));
+        }
+        let mut input_bcs: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
+        for e in inputs { input_bcs.push(encode_expression(e, cs)?); }
+        let mut table_bcs: Vec<Vec<u8>> = Vec::with_capacity(tables.len());
+        for e in tables { table_bcs.push(encode_expression(e, cs)?); }
+        lookup_blobs.push((input_bcs, table_bcs));
+    }
+
+    // ── pre-encode shuffle expression bytecodes ─────────────────────────
+    let mut shuffle_blobs: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)> =
+        Vec::with_capacity(cs.shuffles().len());
+    for shuf in cs.shuffles() {
+        let inputs   = shuf.input_expressions();
+        let shuffles = shuf.shuffle_expressions();
+        if inputs.len() != shuffles.len() {
+            return Err(Error::Compile(
+                "shuffle has mismatched input/shuffle expression counts",
+            ));
+        }
+        let mut input_bcs: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
+        for e in inputs { input_bcs.push(encode_expression(e, cs)?); }
+        let mut shuf_bcs: Vec<Vec<u8>> = Vec::with_capacity(shuffles.len());
+        for e in shuffles { shuf_bcs.push(encode_expression(e, cs)?); }
+        shuffle_blobs.push((input_bcs, shuf_bcs));
     }
 
     // ── pre-resolve permuted column types + query indices ───────────────
@@ -169,6 +223,35 @@ pub fn compile_vk(
     for (col_type, query_index) in &permuted_meta {
         out.push(*col_type);
         out.extend_from_slice(&query_index.to_le_bytes());
+    }
+
+    // v2.0 lookup arguments — one block per `cs.lookups()` entry.
+    out.extend_from_slice(&(lookup_blobs.len() as u32).to_le_bytes());
+    for (input_bcs, table_bcs) in &lookup_blobs {
+        out.extend_from_slice(&(input_bcs.len() as u32).to_le_bytes());
+        for bc in input_bcs {
+            out.extend_from_slice(&(bc.len() as u32).to_le_bytes());
+            out.extend_from_slice(bc);
+        }
+        out.extend_from_slice(&(table_bcs.len() as u32).to_le_bytes());
+        for bc in table_bcs {
+            out.extend_from_slice(&(bc.len() as u32).to_le_bytes());
+            out.extend_from_slice(bc);
+        }
+    }
+    // v2.0 shuffle arguments — one block per `cs.shuffles()` entry.
+    out.extend_from_slice(&(shuffle_blobs.len() as u32).to_le_bytes());
+    for (input_bcs, shuf_bcs) in &shuffle_blobs {
+        out.extend_from_slice(&(input_bcs.len() as u32).to_le_bytes());
+        for bc in input_bcs {
+            out.extend_from_slice(&(bc.len() as u32).to_le_bytes());
+            out.extend_from_slice(bc);
+        }
+        out.extend_from_slice(&(shuf_bcs.len() as u32).to_le_bytes());
+        for bc in shuf_bcs {
+            out.extend_from_slice(&(bc.len() as u32).to_le_bytes());
+            out.extend_from_slice(bc);
+        }
     }
 
     Ok(out)

@@ -15,7 +15,7 @@ use crate::{
     field::fr_to_bytes_be,
     kzg::{shplonk, shplonk::VerifierQuery, KzgVk},
     pairing,
-    plonk::{expression, lagrange, permutation, Challenges, PlonkProof, PlonkProtocol},
+    plonk::{expression, lagrange, lookup, permutation, shuffle, Challenges, PlonkProof, PlonkProtocol},
     proof_reader,
     transcript::Keccak256Transcript,
     vk::parse_vk,
@@ -75,6 +75,8 @@ pub fn compute_expected_h_eval(
     let mut expressions: Vec<Fr> = Vec::new();
     expressions.extend(evaluate_gates(vk, proof, instance_evals, user_challenges)?);
     expressions.extend(permutation::expressions(vk, proof, ch, lag, instance_evals)?);
+    expressions.extend(lookup::expressions(vk, proof, ch, lag, instance_evals, user_challenges)?);
+    expressions.extend(shuffle::expressions(vk, proof, ch, lag, instance_evals, user_challenges)?);
 
     #[cfg(feature = "debug-trace")] {
         for (i, e) in expressions.iter().enumerate() {
@@ -161,6 +163,15 @@ pub fn build_queries(
     // advice column share a commit_id.
     let advice_col_ids:  Vec<usize> = proof.advice_commits.iter().map(|_| id()).collect();
     let perm_prod_ids:   Vec<usize> = proof.permutation_product_commits.iter().map(|_| id()).collect();
+    // v2.0 lookup commit IDs — one each per lookup for product / permuted_input
+    // / permuted_table. The product and permuted_input each get queried at
+    // two points (x + xω, x + xω⁻¹), so SHPLONK groups those into one rotation
+    // set per commit_id.
+    let lookup_product_ids:        Vec<usize> = proof.lookup_product_commits.iter().map(|_| id()).collect();
+    let lookup_permuted_input_ids: Vec<usize> = proof.lookup_permuted_input_commits.iter().map(|_| id()).collect();
+    let lookup_permuted_table_ids: Vec<usize> = proof.lookup_permuted_table_commits.iter().map(|_| id()).collect();
+    // v2.0 shuffle commit IDs — 1 product commit per shuffle, queried at x + xω.
+    let shuffle_product_ids:       Vec<usize> = proof.shuffle_product_commits.iter().map(|_| id()).collect();
     let fixed_col_ids:   Vec<usize> = vk.fixed_commitments.iter().map(|_| id()).collect();
     let perm_common_ids: Vec<usize> = vk.permutation_commitments.iter().map(|_| id()).collect();
     let h_id      = id();
@@ -196,6 +207,47 @@ pub fn build_queries(
         let (_z, _z_omega, z_last) = proof.permutation_product_evals[i];
         let commit = proof.permutation_product_commits[i];
         q.push(VerifierQuery { commit_id: perm_prod_ids[i], commitment: commit, point: x_last, eval: z_last });
+    }
+    // (2.5) v2.0 lookup queries — 5 per lookup, in halo2's
+    // `lookup::Evaluated::queries` order:
+    //   product@x, permuted_input@x, permuted_table@x,
+    //   permuted_input@(x·ω⁻¹), product@(x·ω)
+    // x_prev = x · ω⁻¹ via `rotate_point(x, ω, -1, n)` (cyclic identity).
+    if vk.num_lookups() != proof.lookup_evals.len()
+        || vk.num_lookups() != proof.lookup_product_commits.len()
+        || vk.num_lookups() != proof.lookup_permuted_input_commits.len()
+        || vk.num_lookups() != proof.lookup_permuted_table_commits.len()
+    {
+        return Err(Error::Protocol("build_queries: lookup commit/eval count mismatch"));
+    }
+    if vk.num_lookups() > 0 {
+        let x_prev = rotate_point(ch.x, omega, -1, n);
+        for i in 0..vk.num_lookups() {
+            let evals = proof.lookup_evals[i];
+            let p_commit  = proof.lookup_product_commits[i];
+            let pi_commit = proof.lookup_permuted_input_commits[i];
+            let pt_commit = proof.lookup_permuted_table_commits[i];
+
+            q.push(VerifierQuery { commit_id: lookup_product_ids[i],        commitment: p_commit,  point: ch.x,   eval: evals.product_eval });
+            q.push(VerifierQuery { commit_id: lookup_permuted_input_ids[i], commitment: pi_commit, point: ch.x,   eval: evals.permuted_input_eval });
+            q.push(VerifierQuery { commit_id: lookup_permuted_table_ids[i], commitment: pt_commit, point: ch.x,   eval: evals.permuted_table_eval });
+            q.push(VerifierQuery { commit_id: lookup_permuted_input_ids[i], commitment: pi_commit, point: x_prev, eval: evals.permuted_input_inv_eval });
+            q.push(VerifierQuery { commit_id: lookup_product_ids[i],        commitment: p_commit,  point: x_next, eval: evals.product_next_eval });
+        }
+    }
+    // (2.6) v2.0 shuffle queries — 2 per shuffle:
+    //   product@x, product@(x·ω). The same commit is queried at two
+    //   distinct points → SHPLONK groups them via the shared commit_id.
+    if vk.num_shuffles() != proof.shuffle_evals.len()
+        || vk.num_shuffles() != proof.shuffle_product_commits.len()
+    {
+        return Err(Error::Protocol("build_queries: shuffle commit/eval count mismatch"));
+    }
+    for i in 0..vk.num_shuffles() {
+        let (z, z_w) = proof.shuffle_evals[i];
+        let commit   = proof.shuffle_product_commits[i];
+        q.push(VerifierQuery { commit_id: shuffle_product_ids[i], commitment: commit, point: ch.x,   eval: z });
+        q.push(VerifierQuery { commit_id: shuffle_product_ids[i], commitment: commit, point: x_next, eval: z_w });
     }
     // (3) Fixed — one VerifierQuery per fixed query.
     for (q_idx, (col_index, rotation)) in vk.fixed_queries.iter().enumerate() {
@@ -324,12 +376,12 @@ pub fn verify(
         vk.k, vk.omega, ch.x, &vk.instance_queries, &public_inputs_per_column,
     )?;
 
-    // user_challenges placeholder — circuits with `vk.num_challenges > 0`
-    // need a separate challenge-derivation pass; out of scope for v1.5.
-    let user_challenges: alloc::vec::Vec<Fr> = alloc::vec::Vec::new();
-
+    // v2.0: user-defined phase challenges are squeezed in `read_proof` and
+    // live on `ch.user_challenges` (length = vk.num_challenges). Single-phase
+    // circuits get one batch right after advice commits; multi-phase is
+    // rejected at compile-vk time.
     let expected_h_eval = compute_expected_h_eval(
-        &vk, &proof, &ch, &lag, &instance_evals, &user_challenges,
+        &vk, &proof, &ch, &lag, &instance_evals, &ch.user_challenges,
     )?;
 
     // 5. Aggregate the h-pieces into one virtual commitment.
@@ -429,6 +481,12 @@ mod tests {
             random_poly_eval: Fr::ZERO,
             permutation_common_evals: alloc::vec![Fr::ZERO; 3],
             permutation_product_evals: alloc::vec![(Fr::ONE, Fr::ONE, Fr::ONE)],
+            lookup_permuted_input_commits: Vec::new(),
+            lookup_permuted_table_commits: Vec::new(),
+            lookup_product_commits:        Vec::new(),
+            lookup_evals:                  Vec::new(),
+            shuffle_product_commits:       Vec::new(),
+            shuffle_evals:                 Vec::new(),
             opening_proof_w: G1::IDENTITY,
             opening_proof_w_prime: G1::IDENTITY,
         }
@@ -494,6 +552,7 @@ mod tests {
             theta: Fr::ONE, beta: Fr::ONE, gamma: Fr::ONE,
             y: Fr::ONE, x: Fr::from(7u64),
             shplonk_y: Fr::ONE, shplonk_v: Fr::ONE, shplonk_u: Fr::ONE,
+            user_challenges: Vec::new(),
         };
         let qs = build_queries(&vk, &proof, &ch, G1::IDENTITY, Fr::ZERO, vk.omega, Fr::ONE).unwrap();
         // 3 advice + 5 fixed + 3 perm_common + 2 perm_product (no last for single chunk)
