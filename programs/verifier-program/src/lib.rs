@@ -42,6 +42,18 @@ pub mod errors {
     pub const KZG_OUT_OF_BOUNDS:  u32 = 0x103;
     pub const VERIFIER_REJECTED:  u32 = 0x200;
     pub const VERIFIER_ERROR:     u32 = 0x201;
+    /// 2-tx split: stage_state account bytes did not deserialize into a
+    /// valid `Stage1Output` (wrong magic / version / size).
+    pub const STAGE_INVALID:       u32 = 0x202;
+    /// 2-tx split: signer of stage2 differs from `Stage1Output.payer`,
+    /// OR instruction-data nonce differs from `Stage1Output.nonce`.
+    pub const STAGE_AUTH_MISMATCH: u32 = 0x203;
+    /// 2-tx split: replay-binding hashes (vk / proof / instance) do not
+    /// match the current data account at stage2 time.
+    pub const STAGE_REPLAY_MISMATCH: u32 = 0x204;
+    /// 2-tx split: stage_state account is too small to hold the
+    /// serialised `Stage1Output`.
+    pub const STAGE_PDA_TOO_SMALL: u32 = 0x205;
     pub const LOAD_OOB:           u32 = 0x300;
     pub const NO_ACCOUNT:         u32 = 0x301;
 }
@@ -49,6 +61,13 @@ pub mod errors {
 /// Instruction tags carried in `instruction_data[0]`.
 pub const VERIFY_TAG: u8 = 0x00;
 pub const LOAD_TAG:   u8 = 0x01;
+/// 2-tx split stage 1: runs verify up to `compute_expected_h_eval` +
+/// `aggregate_h_commitment`, writes intermediate state to
+/// `accounts[1]` (the stage_state account).
+pub const STAGE1_TAG: u8 = 0x02;
+/// 2-tx split stage 2: reads stage_state from `accounts[1]`, performs
+/// replay-binding check, runs `build_queries` + SHPLONK + pairing.
+pub const STAGE2_TAG: u8 = 0x03;
 
 /// Parse the on-chain instruction-data layout into the inputs `verify()` needs.
 /// `no_std`-friendly; allocations only happen inside `verify()`'s temporaries.
@@ -184,13 +203,10 @@ pub fn run(instruction_data: &[u8]) -> Result<(), u32> {
     }
 }
 
-/// Stage-by-stage verify with `sol_log_compute_units_` between each step.
-/// Builds nothing the default path doesn't also build, so the per-stage
-/// CU readings reflect production code (modulo the cost of the syscalls
-/// themselves, which are uniform).
-/// Lifts the instance-eval reconstruction out of `run_traced` so its
-/// `Vec<Vec<Fr>>` intermediates live in a separate BPF stack frame.
-#[cfg(feature = "stage-trace")]
+/// Lifts the instance-eval reconstruction out of `run_traced` /
+/// `run_stage1` so its `Vec<Vec<Fr>>` intermediates live in a
+/// separate BPF stack frame (the SBF 4 KB stack budget overflows
+/// otherwise).
 #[inline(never)]
 fn reconstruct_instance_evals_helper(
     vk: &halo2_solana_verifier::plonk::PlonkProtocol,
@@ -216,8 +232,7 @@ fn reconstruct_instance_evals_helper(
 }
 
 /// `ω^(n − blinding_factors − 1)` — used by `build_queries`. Lifted out
-/// of `run_traced` for the same stack-frame reason as above.
-#[cfg(feature = "stage-trace")]
+/// of `run_traced` / `run_stage1` for the same stack-frame reason as above.
 #[inline(never)]
 fn compute_omega_last(k: u32, omega: ark_bn254::Fr, blinding_factors: usize) -> ark_bn254::Fr {
     let n: u64 = 1u64 << k;
@@ -302,6 +317,190 @@ fn run_traced(
 }
 
 // ---------------------------------------------------------------------------
+// 2-tx split: stage 1 (read_proof + lagrange + expected_h_eval +
+// h_commit + omega_last → write Stage1Output to PDA) and stage 2
+// (read PDA + replay-check + build_queries + SHPLONK + pairing).
+// ---------------------------------------------------------------------------
+
+/// Stage1Output is serialised into the stage_state account as
+/// `[u32 LE serialised_len][Stage1Output bytes][zero-padding]`. The
+/// length prefix lets stage2 deserialise without knowing the exact
+/// circuit shape.
+const STAGE_LEN_PREFIX: usize = 4;
+
+/// Run the 2-tx split's stage 1. Verifies up through `compute_expected_h_eval`
+/// and `aggregate_h_commitment`, then serialises the derived state into
+/// `stage_state_account` with a 4-byte length prefix.
+pub fn run_stage1(
+    nonce: u64,
+    payer: &[u8; 32],
+    data_account: &[u8],
+    stage_state_account: &mut [u8],
+) -> Result<(), u32> {
+    use halo2_solana_verifier::{
+        plonk::{lagrange, verifier as v, PlonkProof, PlonkProtocol, Challenges},
+        transcript::Keccak256Transcript,
+        proof_reader,
+        stage_state::{compute_replay_hashes, Stage1Output},
+    };
+
+    // Parse data account (vk + proof + kzg + public_inputs). Same layout
+    // as the 1-tx VERIFY_TAG path.
+    let (vk_bytes, proof_bytes, _kzg_vk, public_inputs) = parse_instruction(data_account)?;
+
+    // Replay-binding hashes — stage2 will re-compute and compare.
+    let (vk_hash, proof_hash, instance_hash) =
+        compute_replay_hashes(vk_bytes, proof_bytes, &public_inputs);
+
+    // Verify first half.
+    let vk: PlonkProtocol = halo2_solana_verifier::vk::parse_vk(vk_bytes)
+        .map_err(|_| errors::VERIFIER_ERROR)?;
+    let mut transcript = Keccak256Transcript::new(&vk.transcript_repr);
+    let (proof, ch): (PlonkProof, Challenges) = proof_reader::read_proof(
+        &vk, proof_bytes, &public_inputs, &mut transcript,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+
+    let lag = lagrange::evaluate_lagrange(vk.k, vk.omega, ch.x, vk.blinding_factors)
+        .map_err(|_| errors::VERIFIER_ERROR)?;
+    let instance_evals = reconstruct_instance_evals_helper(&vk, ch.x, &public_inputs)?;
+    let expected_h_eval = v::compute_expected_h_eval(
+        &vk, &proof, &ch, &lag, &instance_evals, &ch.user_challenges,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+    let h_commitment = v::aggregate_h_commitment(&proof.vanishing_h_commits, lag.xn)
+        .map_err(|_| errors::VERIFIER_ERROR)?;
+    let omega_last = compute_omega_last(vk.k, vk.omega, vk.blinding_factors);
+
+    // Build Stage1Output.
+    let stage1 = Stage1Output {
+        theta: ch.theta,
+        beta: ch.beta,
+        gamma: ch.gamma,
+        y: ch.y,
+        x: ch.x,
+        shplonk_y: ch.shplonk_y,
+        shplonk_v: ch.shplonk_v,
+        shplonk_u: ch.shplonk_u,
+        user_challenges: ch.user_challenges,
+        l_0: lag.l_0,
+        l_last: lag.l_last,
+        l_blind: lag.l_blind,
+        xn: lag.xn,
+        expected_h_eval,
+        h_commitment,
+        omega_last,
+        instance_evals,
+        vk_hash,
+        proof_hash,
+        instance_hash,
+        payer: *payer,
+        nonce,
+    };
+
+    // Serialise.
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(stage1.serialized_size());
+    stage1.serialize(&mut buf).map_err(|_| errors::STAGE_INVALID)?;
+
+    let total = STAGE_LEN_PREFIX + buf.len();
+    if total > stage_state_account.len() {
+        return Err(errors::STAGE_PDA_TOO_SMALL);
+    }
+
+    // [u32 LE len | Stage1Output bytes | zero-padding].
+    let len_le = (buf.len() as u32).to_le_bytes();
+    stage_state_account[..STAGE_LEN_PREFIX].copy_from_slice(&len_le);
+    stage_state_account[STAGE_LEN_PREFIX..STAGE_LEN_PREFIX + buf.len()].copy_from_slice(&buf);
+    for b in &mut stage_state_account[STAGE_LEN_PREFIX + buf.len()..] {
+        *b = 0;
+    }
+
+    Ok(())
+}
+
+/// Run the 2-tx split's stage 2. Reads stage_state from a per-payer
+/// account, replay-checks against the current data account, and runs
+/// `build_queries` + SHPLONK opening + pairing.
+pub fn run_stage2(
+    nonce: u64,
+    payer: &[u8; 32],
+    data_account: &[u8],
+    stage_state_account: &[u8],
+) -> Result<(), u32> {
+    use halo2_solana_verifier::{
+        plonk::{verifier as v, PlonkProof, PlonkProtocol},
+        proof_reader, kzg::shplonk, pairing,
+        stage_state::{compute_replay_hashes, Stage1Output},
+    };
+
+    // Read length prefix and slice out the serialised Stage1Output.
+    if stage_state_account.len() < STAGE_LEN_PREFIX {
+        return Err(errors::STAGE_INVALID);
+    }
+    let stored_len = u32::from_le_bytes([
+        stage_state_account[0], stage_state_account[1],
+        stage_state_account[2], stage_state_account[3],
+    ]) as usize;
+    let end = STAGE_LEN_PREFIX
+        .checked_add(stored_len)
+        .ok_or(errors::STAGE_INVALID)?;
+    if end > stage_state_account.len() {
+        return Err(errors::STAGE_INVALID);
+    }
+    let stage1 = Stage1Output::deserialize(&stage_state_account[STAGE_LEN_PREFIX..end])
+        .map_err(|_| errors::STAGE_INVALID)?;
+
+    // Auth check 1: signer pubkey matches stage1.payer.
+    if stage1.payer != *payer {
+        return Err(errors::STAGE_AUTH_MISMATCH);
+    }
+    // Auth check 2: instruction-data nonce matches.
+    if stage1.nonce != nonce {
+        return Err(errors::STAGE_AUTH_MISMATCH);
+    }
+
+    // Re-parse the data account.
+    let (vk_bytes, proof_bytes, kzg_vk, public_inputs) = parse_instruction(data_account)?;
+
+    // Replay check 3: hashes match — the data account hasn't changed.
+    let (vk_hash, proof_hash, instance_hash) =
+        compute_replay_hashes(vk_bytes, proof_bytes, &public_inputs);
+    if vk_hash != stage1.vk_hash
+        || proof_hash != stage1.proof_hash
+        || instance_hash != stage1.instance_hash
+    {
+        return Err(errors::STAGE_REPLAY_MISMATCH);
+    }
+
+    // Parse proof bytes WITHOUT Fiat–Shamir. Stage 1 already derived the
+    // challenges via the full transcript and stored them in the PDA;
+    // the replay-binding hashes above guarantee the proof bytes feeding
+    // this parse haven't changed since stage 1, so re-running keccak
+    // squeezes here would just waste ~50–80 k CU.
+    let vk: PlonkProtocol = halo2_solana_verifier::vk::parse_vk(vk_bytes)
+        .map_err(|_| errors::VERIFIER_ERROR)?;
+    let proof: PlonkProof = proof_reader::parse_proof_no_fs(&vk, proof_bytes)
+        .map_err(|_| errors::VERIFIER_ERROR)?;
+    let _ = public_inputs;  // already absorbed into instance_hash
+
+    let ch = stage1.challenges();
+    // Note: stage1's `LagrangeEvaluations` are already baked into
+    // `stage1.expected_h_eval`, so build_queries doesn't need them here.
+    // Re-deriving them in stage2 would just waste CU.
+
+    let queries = v::build_queries(
+        &vk, &proof, &ch, stage1.h_commitment, stage1.expected_h_eval,
+        vk.omega, stage1.omega_last,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+
+    let pairs = shplonk::verify_opening(
+        &queries, proof.opening_proof_w, proof.opening_proof_w_prime,
+        ch.shplonk_y, ch.shplonk_v, ch.shplonk_u, &kzg_vk,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+
+    let ok = pairing::pairing_check(&pairs.0).map_err(|_| errors::VERIFIER_ERROR)?;
+    if ok { Ok(()) } else { Err(errors::VERIFIER_REJECTED) }
+}
+
+// ---------------------------------------------------------------------------
 // Pinocchio entrypoint (only when building the .so).
 // ---------------------------------------------------------------------------
 
@@ -319,8 +518,10 @@ mod entry {
     /// the off-chain helper populates with a sequence of LOAD instructions.
     ///
     /// Tag dispatch:
-    ///   * `[VERIFY_TAG]`               + accounts[0] readonly  → verify
+    ///   * `[VERIFY_TAG]`               + accounts[0] readonly  → 1-tx verify
     ///   * `[LOAD_TAG, offset_le, ...]` + accounts[0] writable  → memcpy
+    ///   * `[STAGE1_TAG, nonce_le_8]`   + accounts: [data, stage_state(w), signer]
+    ///   * `[STAGE2_TAG, nonce_le_8]`   + accounts: [data, stage_state, signer]
     ///   * (empty)                                              → host-test path
     fn process_instruction(
         _program_id: &Address,
@@ -353,6 +554,51 @@ mod entry {
                 let acct = &accounts[0];
                 let data: &[u8] = unsafe { acct.borrow_unchecked() };
                 return super::run(data).map_err(ProgramError::Custom);
+            }
+            if tag == super::STAGE1_TAG {
+                // accounts: [data (read), stage_state (write), signer]
+                if accounts.len() < 3 {
+                    return Err(ProgramError::Custom(super::errors::NO_ACCOUNT));
+                }
+                if instruction_data.len() != 1 + 8 {
+                    return Err(ProgramError::Custom(super::errors::MALFORMED_INPUT));
+                }
+                let nonce = u64::from_le_bytes([
+                    instruction_data[1], instruction_data[2],
+                    instruction_data[3], instruction_data[4],
+                    instruction_data[5], instruction_data[6],
+                    instruction_data[7], instruction_data[8],
+                ]);
+                let payer = *accounts[2].address().as_array();
+                // Split the slice so the borrow checker sees disjoint
+                // borrows of accounts[0] (read) and accounts[1] (write).
+                let (left, right) = accounts.split_at_mut(1);
+                // SAFETY: stage1 holds the only writable borrow on the
+                // stage_state account; data account is read-only.
+                let data: &[u8] = unsafe { left[0].borrow_unchecked() };
+                let stage_state: &mut [u8] = unsafe { right[0].borrow_unchecked_mut() };
+                return super::run_stage1(nonce, &payer, data, stage_state)
+                    .map_err(ProgramError::Custom);
+            }
+            if tag == super::STAGE2_TAG {
+                // accounts: [data (read), stage_state (read), signer]
+                if accounts.len() < 3 {
+                    return Err(ProgramError::Custom(super::errors::NO_ACCOUNT));
+                }
+                if instruction_data.len() != 1 + 8 {
+                    return Err(ProgramError::Custom(super::errors::MALFORMED_INPUT));
+                }
+                let nonce = u64::from_le_bytes([
+                    instruction_data[1], instruction_data[2],
+                    instruction_data[3], instruction_data[4],
+                    instruction_data[5], instruction_data[6],
+                    instruction_data[7], instruction_data[8],
+                ]);
+                let payer = *accounts[2].address().as_array();
+                let data: &[u8] = unsafe { accounts[0].borrow_unchecked() };
+                let stage_state: &[u8] = unsafe { accounts[1].borrow_unchecked() };
+                return super::run_stage2(nonce, &payer, data, stage_state)
+                    .map_err(ProgramError::Custom);
             }
         }
         // Fallback: small inputs that fit inside instruction_data (host tests).
@@ -423,5 +669,113 @@ mod tests {
         let buf = std::fs::read(path)
             .expect("run `cargo run -p standard-plonk-circuit --bin gen-proof -- --write-golden` first");
         run(&buf).expect("verifier should accept a valid proof");
+    }
+
+    /// 2-tx split round-trip on the shuffle golden vector. stage1 writes
+    /// state into a buffer, stage2 reads the buffer, replay-checks, and
+    /// runs the second half. Both must succeed end-to-end.
+    #[test]
+    fn stage1_then_stage2_passes_on_shuffle() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect(
+            "run `cargo run -p shuffle-check-circuit --bin gen-sh-proof -- --write-golden` first",
+        );
+        // The shuffle golden uses GLDN0002 magic; transcode to GLDN0001
+        // for the verifier-program's parse_instruction.
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer: [u8; 32] = [0xAB; 32];
+        let nonce: u64 = 0x1122_3344_5566_7788;
+        let mut stage_state = std::vec![0u8; 2048];
+
+        run_stage1(nonce, &payer, &data, &mut stage_state)
+            .expect("stage1 must accept a valid proof");
+        run_stage2(nonce, &payer, &data, &stage_state)
+            .expect("stage2 must accept the matching stage1 output");
+    }
+
+    /// Stage2 with a different `payer` than stage1 → STAGE_AUTH_MISMATCH.
+    #[test]
+    fn stage2_rejects_wrong_payer() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect("missing shuffle golden");
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer_alice: [u8; 32] = [0xAA; 32];
+        let payer_eve:   [u8; 32] = [0xEE; 32];
+        let nonce: u64 = 1;
+        let mut stage_state = std::vec![0u8; 2048];
+
+        run_stage1(nonce, &payer_alice, &data, &mut stage_state).unwrap();
+        let err = run_stage2(nonce, &payer_eve, &data, &stage_state).unwrap_err();
+        assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
+    }
+
+    /// Stage2 with a different `nonce` → STAGE_AUTH_MISMATCH.
+    #[test]
+    fn stage2_rejects_wrong_nonce() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect("missing shuffle golden");
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer: [u8; 32] = [0xAB; 32];
+        let mut stage_state = std::vec![0u8; 2048];
+
+        run_stage1(42, &payer, &data, &mut stage_state).unwrap();
+        let err = run_stage2(43, &payer, &data, &stage_state).unwrap_err();
+        assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
+    }
+
+    /// Stage2 with a tampered data account → STAGE_REPLAY_MISMATCH.
+    /// Mutates one byte of the proof region between stage1 and stage2.
+    #[test]
+    fn stage2_rejects_data_account_tampering() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect("missing shuffle golden");
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer: [u8; 32] = [0xAB; 32];
+        let nonce: u64 = 7;
+        let mut stage_state = std::vec![0u8; 2048];
+
+        run_stage1(nonce, &payer, &data, &mut stage_state).unwrap();
+
+        // Flip one bit of the proof region (skipping past the GLDN0001
+        // magic + vk_len + vk_bytes + proof_len = 8+4+vk_len+4 prefix).
+        let vk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let proof_start = 8 + 4 + vk_len + 4;
+        data[proof_start + 480] ^= 0x01;  // shuffle_product_eval byte
+
+        let err = run_stage2(nonce, &payer, &data, &stage_state).unwrap_err();
+        assert_eq!(err, errors::STAGE_REPLAY_MISMATCH);
+    }
+
+    /// Stage2 against a malformed stage_state buffer → STAGE_INVALID.
+    #[test]
+    fn stage2_rejects_malformed_stage_state() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect("missing shuffle golden");
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer: [u8; 32] = [0xAB; 32];
+        let nonce: u64 = 1;
+        let mut stage_state = std::vec![0u8; 2048];
+
+        run_stage1(nonce, &payer, &data, &mut stage_state).unwrap();
+        // Corrupt the magic bytes inside the Stage1Output blob.
+        stage_state[4] = b'X';
+
+        let err = run_stage2(nonce, &payer, &data, &stage_state).unwrap_err();
+        assert_eq!(err, errors::STAGE_INVALID);
     }
 }

@@ -38,6 +38,7 @@ pub use plonk::proof_reader;
 
 pub mod vk;
 pub mod proof;
+pub mod stage_state;
 
 pub use error::Error;
 

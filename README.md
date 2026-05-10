@@ -17,6 +17,19 @@ The repo is two things:
    syscalls the per-stage CU profile points to (`alt_bn128_g1_msm` and
    `alt_bn128_fr_batch_inverse`).
 
+If you want the short audit-trail version, every claim below is
+linked on a single page: [`docs/EVIDENCE.md`](docs/EVIDENCE.md).
+
+The 2-tx split path that lets lookup-using circuits verify end-to-end
+on devnet today is documented at [`docs/2_tx_split.md`](docs/2_tx_split.md).
+
+The first working app on top of the verifier — a ZK-gated SOL reward
+pool that locks SOL and only releases it on a successful proof — is
+documented at [`docs/reward_pool.md`](docs/reward_pool.md). The
+headline tx
+[`2EbQHB17…ME47`](https://explorer.solana.com/tx/2EbQHB17RVvYsVqBKbmA5c3kSUovrGXZzUo6iLcqU2r4wV8R8kdAFvLeyHj2Heg2Abub6FbAzqDZEFnZLeqBME47?cluster=devnet)
+shows the CLAIM atomically CPI'ing the verifier and transferring 0.1 SOL.
+
 ## What the verifier accepts
 
 The same `.so` handles any halo2 circuit using:
@@ -191,10 +204,12 @@ circuits/
 programs/
   verifier-program/      Pinocchio BPF wrapper around the verifier
   g1-msm-bench/          Mollusk bench grid for the G1 MSM SIMD
+  reward-pool/           ZK-gated SOL escrow — CPI's verifier, releases reward
 
 clients/
   devnet-send/           off-chain devnet roundtrip; supports
                          valid-proof and tampered-proof modes
+  reward-pool-cli/       end-to-end demo CLI (init / claim / close)
 
 docs/
   cu_profile.md          per-stage CU profile, on-chain evidence,
@@ -275,13 +290,18 @@ in `docs/simd-proposals/` follow the structure of SIMD-0302
 | v1 — StandardPlonk-only verifier | done |
 | v1.5 — generic gate AST, multi-circuit | done |
 | v2.0 — lookup + shuffle + single-phase challenges | done, audit-hardened |
-| v2.1 — mainnet ops (2-tx split, LE format, free-able allocator) | partial; only SIMD drafts landed |
-| First successful on-chain Halo2 verify-tx | landed (shuffle) |
+| v2.1 — 2-tx split + skip-FS optimization | landed; range-check (Plookup) end-to-end on devnet |
+| Phase 2 — `reward-pool` ZK-gated SOL escrow + CLI | landed; full claim flow on devnet, 1.06 M CU under cap |
+| First successful on-chain Halo2 verify-tx (1-tx) | landed (shuffle, 1.37 M CU) |
+| First lookup-using verifier on-chain (2-tx) | landed (range-check, 860 k + 1,063 k CU) |
+| First working application built on the verifier | landed (reward-pool, atomic ZK→SOL transfer) |
 | Layer 2 SIMD draft + reference impl | landed |
 | Layer 3 SIMD draft + reference impl | landed |
 | Formal SIMD-XXXX PR submission | open |
+| LE byte format (SIMD-0284 mainnet) | open |
+| Free-able allocator (Pinocchio bump → linked-list) | open |
 
-`cargo test --workspace` reports 101 / 101 at HEAD.
+`cargo test --workspace` reports 124 / 124 at HEAD.
 
 ## License
 

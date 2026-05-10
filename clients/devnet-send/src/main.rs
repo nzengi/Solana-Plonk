@@ -55,6 +55,15 @@ const KEYPAIR_PATH: &str = "/home/nzengi/.config/solana/id.json";
 
 const VERIFY_TAG: u8 = 0x00;
 const LOAD_TAG:   u8 = 0x01;
+const STAGE1_TAG: u8 = 0x02;
+const STAGE2_TAG: u8 = 0x03;
+
+/// Allocation size for the stage_state account in the 2-tx flow.
+/// Worst-case Stage1Output is ~2,720 bytes (4 B prefix + 668 B fixed +
+/// 32 B × 64 max user_challenges + instance_evals). Round to a safe
+/// 4 KB; for current circuits (Fibonacci, range-check, multi-lookup,
+/// shuffle) we use 600–1,000 bytes of it.
+const STAGE_STATE_BYTES: usize = 4096;
 
 /// Translate a `GLDN0002` blob (Fibonacci / range-check / shuffle goldens)
 /// into the verifier-program's `GLDN0001` instruction-data layout. The
@@ -88,6 +97,7 @@ enum Mode {
     Fibonacci,
     RangeCheck,
     Shuffle,
+    MultiLookup,
 }
 
 fn main() -> Result<()> {
@@ -100,6 +110,8 @@ fn main() -> Result<()> {
         Mode::RangeCheck
     } else if std::env::args().any(|a| a == "--sh") {
         Mode::Shuffle
+    } else if std::env::args().any(|a| a == "--ml") {
+        Mode::MultiLookup
     } else {
         Mode::StandardPlonk
     };
@@ -114,6 +126,8 @@ fn main() -> Result<()> {
                                 "Range-check (Plookup), GLDN0002 → repackaged", true),
         Mode::Shuffle       => ("../../circuits/shuffle-check/tests/golden_v2_sh.bin",
                                 "Shuffle, GLDN0002 → repackaged", true),
+        Mode::MultiLookup   => ("../../circuits/multi-lookup-check/tests/golden_v2_ml.bin",
+                                "Multi-lookup (2 Plookup), GLDN0002 → repackaged", true),
     };
     let mut golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     golden.push(rel_path);
@@ -220,7 +234,13 @@ fn main() -> Result<()> {
     }
     eprintln!("[4/?] data account fully populated ({} B)", payload_len);
 
-    // ── final tx: verify ──
+    // ── 2-tx split path (--two-tx) ──
+    let two_tx_mode = std::env::args().any(|a| a == "--two-tx");
+    if two_tx_mode {
+        return run_two_tx_flow(&client, &payer, &program_id, &data_acct.pubkey());
+    }
+
+    // ── single verify tx (default) ──
     let cb_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
     let cb_heap  = ComputeBudgetInstruction::request_heap_frame(256 * 1024);
     let verify_ix = Instruction {
@@ -267,6 +287,142 @@ fn main() -> Result<()> {
             eprintln!("    submit FAILED: {e:#}");
         }
     }
+
+    Ok(())
+}
+
+/// 2-tx split flow. Assumes the data account is already populated.
+///
+/// Steps:
+///   1. Allocate a fresh stage_state account (rent-exempt, owned by the
+///      verifier program), size = STAGE_STATE_BYTES.
+///   2. Submit STAGE1 tx — verifier writes Stage1Output bytes into the
+///      stage_state account; CU limit 1.4 M, heap 256 KB.
+///   3. Submit STAGE2 tx — verifier reads stage_state, replay-checks
+///      against the data account, runs build_queries + SHPLONK + pairing.
+///   4. Print all three tx signatures with explorer links.
+///
+/// The `nonce` is bound into both STAGE1 and STAGE2 instruction data and
+/// re-checked inside the program; using a different nonce in stage2 →
+/// `STAGE_AUTH_MISMATCH`.
+fn run_two_tx_flow(
+    client:    &RpcClient,
+    payer:     &Keypair,
+    program_id: &Pubkey,
+    data_acct:  &Pubkey,
+) -> Result<()> {
+    use solana_client::rpc_config::RpcSendTransactionConfig;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // ── allocate stage_state account ──
+    let stage_state_acct = Keypair::new();
+    let stage_state_rent = client.get_minimum_balance_for_rent_exemption(STAGE_STATE_BYTES)?;
+    eprintln!(
+        "[5a/?] stage_state account = {} ({} B, rent {} lamports)",
+        stage_state_acct.pubkey(), STAGE_STATE_BYTES, stage_state_rent,
+    );
+    let create_stage_ix = system_instruction::create_account(
+        &payer.pubkey(),
+        &stage_state_acct.pubkey(),
+        stage_state_rent,
+        STAGE_STATE_BYTES as u64,
+        program_id,
+    );
+    let blockhash = client.get_latest_blockhash()?;
+    let tx_create_stage = Transaction::new_signed_with_payer(
+        &[create_stage_ix],
+        Some(&payer.pubkey()),
+        &[payer, &stage_state_acct],
+        blockhash,
+    );
+    let sig = client.send_and_confirm_transaction(&tx_create_stage)
+        .context("create stage_state account tx")?;
+    eprintln!("    ✓ stage_state created — sig {sig}");
+
+    // ── pick a per-attempt nonce ──
+    let nonce: u64 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    eprintln!("[5b/?] nonce = {:#018x}", nonce);
+
+    let cb_limit = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+    let cb_heap  = ComputeBudgetInstruction::request_heap_frame(256 * 1024);
+    let cfg = RpcSendTransactionConfig {
+        skip_preflight: true,
+        ..RpcSendTransactionConfig::default()
+    };
+
+    // ── STAGE1 tx ──
+    let mut stage1_data = Vec::with_capacity(9);
+    stage1_data.push(STAGE1_TAG);
+    stage1_data.extend_from_slice(&nonce.to_le_bytes());
+    let stage1_ix = Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*data_acct, false),               // data (read)
+            AccountMeta::new(stage_state_acct.pubkey(), false),         // stage_state (write)
+            AccountMeta::new(payer.pubkey(), true),                     // signer
+        ],
+        data: stage1_data,
+    };
+    let blockhash = client.get_latest_blockhash()?;
+    let tx_stage1 = Transaction::new_signed_with_payer(
+        &[cb_limit.clone(), cb_heap.clone(), stage1_ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    );
+    eprintln!("[5c/?] sending STAGE1 tx (CU 1.4M, heap 256KB)…");
+    let sig1 = match client.send_transaction_with_config(&tx_stage1, cfg) {
+        Ok(s)  => s,
+        Err(e) => {
+            eprintln!("    submit FAILED: {e:#}");
+            return Err(anyhow::anyhow!("stage1 submit failed"));
+        }
+    };
+    eprintln!("    submitted: {sig1}");
+    let _ = client.confirm_transaction(&sig1);
+    eprintln!("    https://explorer.solana.com/tx/{sig1}?cluster=devnet");
+
+    // ── STAGE2 tx ──
+    let mut stage2_data = Vec::with_capacity(9);
+    stage2_data.push(STAGE2_TAG);
+    stage2_data.extend_from_slice(&nonce.to_le_bytes());
+    let stage2_ix = Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*data_acct, false),               // data (read)
+            AccountMeta::new_readonly(stage_state_acct.pubkey(), false),// stage_state (read)
+            AccountMeta::new(payer.pubkey(), true),                     // signer
+        ],
+        data: stage2_data,
+    };
+    let blockhash = client.get_latest_blockhash()?;
+    let tx_stage2 = Transaction::new_signed_with_payer(
+        &[cb_limit, cb_heap, stage2_ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    );
+    eprintln!("[5d/?] sending STAGE2 tx (CU 1.4M, heap 256KB)…");
+    let sig2 = match client.send_transaction_with_config(&tx_stage2, cfg) {
+        Ok(s)  => s,
+        Err(e) => {
+            eprintln!("    submit FAILED: {e:#}");
+            return Err(anyhow::anyhow!("stage2 submit failed"));
+        }
+    };
+    eprintln!("    submitted: {sig2}");
+    let _ = client.confirm_transaction(&sig2);
+    eprintln!("    https://explorer.solana.com/tx/{sig2}?cluster=devnet");
+
+    eprintln!();
+    eprintln!("STAGE1 + STAGE2 submitted on devnet:");
+    eprintln!("  stage1: https://explorer.solana.com/tx/{sig1}?cluster=devnet");
+    eprintln!("  stage2: https://explorer.solana.com/tx/{sig2}?cluster=devnet");
+    eprintln!();
+    eprintln!("Inspect via `solana confirm -v <SIG> -u devnet`. Both should");
+    eprintln!("succeed for circuits whose stage1 and stage2 each fit under 1.4 M CU");
+    eprintln!("(range-check, shuffle). Larger circuits may exhaust the cap on");
+    eprintln!("stage2 (Fibonacci ~1.47M CU, multi-lookup similar).");
 
     Ok(())
 }

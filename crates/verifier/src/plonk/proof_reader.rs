@@ -231,6 +231,180 @@ fn read_g1s(
     Ok(out)
 }
 
+/// Parse proof bytes into `PlonkProof` **without** running the Fiat–Shamir
+/// transcript. The challenges are trusted from another source — in
+/// practice the 2-tx split's `Stage1Output` (which derived them via the
+/// full transcript in stage 1).
+///
+/// Saves the keccak squeezes and absorb-buffer growth that `read_proof`
+/// performs. On BPF this is roughly ~50–80 k CU, depending on how many
+/// challenges + how large the absorbed proof transcript would have grown.
+///
+/// **Soundness note**: this function does NOT verify the challenges are
+/// the right ones. Caller MUST have a separate replay-binding mechanism
+/// (e.g. stage 1's `vk_hash` / `proof_hash` / `instance_hash` triple) to
+/// guarantee the proof bytes used here match the ones that produced the
+/// trusted challenges. Otherwise a tampered proof's commits/evals would
+/// fly through this parser unchecked.
+pub fn parse_proof_no_fs(
+    vk:          &PlonkProtocol,
+    proof_bytes: &[u8],
+) -> Result<PlonkProof, Error> {
+    let mut cur = 0usize;
+
+    // (1) advice commits
+    let advice_commits = read_g1s_no_fs(proof_bytes, &mut cur, vk.num_advice)?;
+
+    // (1.6) per-lookup permuted_input + permuted_table commits
+    let mut lookup_permuted_input_commits = Vec::with_capacity(vk.num_lookups());
+    let mut lookup_permuted_table_commits = Vec::with_capacity(vk.num_lookups());
+    for _ in 0..vk.num_lookups() {
+        lookup_permuted_input_commits.push(read_g1_no_fs(proof_bytes, &mut cur)?);
+        lookup_permuted_table_commits.push(read_g1_no_fs(proof_bytes, &mut cur)?);
+    }
+
+    // (2) permutation product commits
+    let permutation_product_commits =
+        read_g1s_no_fs(proof_bytes, &mut cur, vk.num_perm_chunks)?;
+
+    // (2.5) per-lookup grand-product commits + per-shuffle product commits
+    let lookup_product_commits =
+        read_g1s_no_fs(proof_bytes, &mut cur, vk.num_lookups())?;
+    let shuffle_product_commits =
+        read_g1s_no_fs(proof_bytes, &mut cur, vk.num_shuffles())?;
+
+    // (3) random_poly commit
+    let random_poly_commit = read_g1_no_fs(proof_bytes, &mut cur)?;
+
+    // (4) vanishing h pieces
+    let h_count = vk.cs_degree.saturating_sub(1);
+    let vanishing_h_commits = read_g1s_no_fs(proof_bytes, &mut cur, h_count)?;
+
+    // (5,6) advice evals + fixed evals
+    let advice_evals = read_scalars_no_fs(proof_bytes, &mut cur, vk.num_advice_queries)?;
+    let fixed_evals  = read_scalars_no_fs(proof_bytes, &mut cur, vk.num_fixed_queries)?;
+
+    // (7) random_poly eval
+    let random_poly_eval = read_scalar_no_fs(proof_bytes, &mut cur)?;
+
+    // (8) permutation common evals
+    let permutation_common_evals =
+        read_scalars_no_fs(proof_bytes, &mut cur, vk.num_perm_columns())?;
+
+    // (9) permutation product evals — same shape as `read_proof`.
+    let mut permutation_product_evals = Vec::with_capacity(vk.num_perm_chunks);
+    for i in 0..vk.num_perm_chunks {
+        let z       = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        let z_omega = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        let z_last  = if i + 1 < vk.num_perm_chunks {
+            read_scalar_no_fs(proof_bytes, &mut cur)?
+        } else {
+            Fr::from(0u64)
+        };
+        permutation_product_evals.push((z, z_omega, z_last));
+    }
+
+    // (9.5) per-lookup 5 evals
+    let mut lookup_evals = Vec::with_capacity(vk.num_lookups());
+    for _ in 0..vk.num_lookups() {
+        let product_eval            = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        let product_next_eval       = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        let permuted_input_eval     = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        let permuted_input_inv_eval = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        let permuted_table_eval     = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        lookup_evals.push(crate::plonk::LookupEvals {
+            product_eval,
+            product_next_eval,
+            permuted_input_eval,
+            permuted_input_inv_eval,
+            permuted_table_eval,
+        });
+    }
+
+    // (9.6) per-shuffle 2 evals
+    let mut shuffle_evals = Vec::with_capacity(vk.num_shuffles());
+    for _ in 0..vk.num_shuffles() {
+        let product_eval      = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        let product_next_eval = read_scalar_no_fs(proof_bytes, &mut cur)?;
+        shuffle_evals.push((product_eval, product_next_eval));
+    }
+
+    // SHPLONK opening proofs
+    let opening_proof_w       = read_g1_no_fs(proof_bytes, &mut cur)?;
+    let opening_proof_w_prime = read_g1_no_fs(proof_bytes, &mut cur)?;
+
+    if cur != proof_bytes.len() {
+        return Err(Error::InvalidProofEncoding);
+    }
+
+    Ok(PlonkProof {
+        advice_commits,
+        permutation_product_commits,
+        random_poly_commit,
+        vanishing_h_commits,
+        advice_evals,
+        fixed_evals,
+        random_poly_eval,
+        permutation_common_evals,
+        permutation_product_evals,
+        lookup_permuted_input_commits,
+        lookup_permuted_table_commits,
+        lookup_product_commits,
+        lookup_evals,
+        shuffle_product_commits,
+        shuffle_evals,
+        opening_proof_w,
+        opening_proof_w_prime,
+    })
+}
+
+#[inline]
+fn read_g1_no_fs(proof: &[u8], cursor: &mut usize) -> Result<crate::curve::G1, Error> {
+    if cursor.checked_add(64).map_or(true, |end| end > proof.len()) {
+        return Err(Error::InvalidProofEncoding);
+    }
+    let bytes: [u8; 64] = proof[*cursor..*cursor + 64].try_into().unwrap();
+    *cursor += 64;
+    Ok(crate::curve::G1(bytes))
+}
+
+#[inline]
+fn read_g1s_no_fs(
+    proof: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<Vec<crate::curve::G1>, Error> {
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(read_g1_no_fs(proof, cursor)?);
+    }
+    Ok(out)
+}
+
+#[inline]
+fn read_scalar_no_fs(proof: &[u8], cursor: &mut usize) -> Result<Fr, Error> {
+    if cursor.checked_add(32).map_or(true, |end| end > proof.len()) {
+        return Err(Error::InvalidProofEncoding);
+    }
+    let bytes: &[u8; 32] = proof[*cursor..*cursor + 32].try_into().unwrap();
+    let scalar = crate::field::fr_from_bytes_be(bytes)?;
+    *cursor += 32;
+    Ok(scalar)
+}
+
+#[inline]
+fn read_scalars_no_fs(
+    proof: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<Vec<Fr>, Error> {
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(read_scalar_no_fs(proof, cursor)?);
+    }
+    Ok(out)
+}
+
 #[inline]
 fn read_scalars(
     transcript: &mut Keccak256Transcript,
@@ -449,5 +623,86 @@ mod tests {
         //    + 3 perm_common + (3·0+2)=2 perm-product = 14 → 448 B
         // total 1088
         assert_eq!(expected_proof_size(&vk), 1088);
+    }
+
+    /// `parse_proof_no_fs` produces the same `PlonkProof` as `read_proof`
+    /// for any valid input. Verified against a real shuffle golden vector;
+    /// every field byte-equal. The two functions diverge only in their
+    /// internal Fiat–Shamir behaviour, which doesn't affect the parsed
+    /// proof structure.
+    #[test]
+    fn parse_proof_no_fs_matches_read_proof_on_shuffle() {
+        let raw = std::fs::read("../../circuits/shuffle-check/tests/golden_v2_sh.bin")
+            .expect("missing shuffle golden — run `cargo run -p shuffle-check-circuit --bin gen-sh-proof -- --write-golden`");
+        // GLDN0002 layout: 8 magic + 4 vk_len + vk + 4 proof_len + proof + ...
+        let vk_len = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+        let vk_bytes = &raw[12..12 + vk_len];
+        let proof_off = 12 + vk_len + 4;
+        let proof_len = u32::from_le_bytes([
+            raw[12 + vk_len], raw[12 + vk_len + 1],
+            raw[12 + vk_len + 2], raw[12 + vk_len + 3],
+        ]) as usize;
+        let proof_bytes = &raw[proof_off..proof_off + proof_len];
+
+        let vk = crate::vk::parse_vk(vk_bytes).unwrap();
+
+        // Path A: full read_proof with FS.
+        let mut t = Keccak256Transcript::new(&vk.transcript_repr);
+        let (proof_a, _ch) = read_proof(&vk, proof_bytes, &[], &mut t).unwrap();
+
+        // Path B: skip-FS parser.
+        let proof_b = parse_proof_no_fs(&vk, proof_bytes).unwrap();
+
+        // Every field must be byte-identical between the two paths.
+        assert_eq!(proof_a.advice_commits.len(), proof_b.advice_commits.len());
+        for (a, b) in proof_a.advice_commits.iter().zip(proof_b.advice_commits.iter()) {
+            assert_eq!(a.0, b.0, "advice commit mismatch");
+        }
+        assert_eq!(proof_a.permutation_product_commits.len(),
+                   proof_b.permutation_product_commits.len());
+        assert_eq!(proof_a.random_poly_commit.0, proof_b.random_poly_commit.0);
+        assert_eq!(proof_a.vanishing_h_commits.len(), proof_b.vanishing_h_commits.len());
+        for (a, b) in proof_a.vanishing_h_commits.iter().zip(proof_b.vanishing_h_commits.iter()) {
+            assert_eq!(a.0, b.0, "h piece commit mismatch");
+        }
+        assert_eq!(proof_a.advice_evals, proof_b.advice_evals);
+        assert_eq!(proof_a.fixed_evals, proof_b.fixed_evals);
+        assert_eq!(proof_a.random_poly_eval, proof_b.random_poly_eval);
+        assert_eq!(proof_a.permutation_common_evals, proof_b.permutation_common_evals);
+        assert_eq!(proof_a.permutation_product_evals, proof_b.permutation_product_evals);
+        assert_eq!(proof_a.shuffle_product_commits.len(),
+                   proof_b.shuffle_product_commits.len());
+        for (a, b) in proof_a.shuffle_product_commits.iter()
+                                .zip(proof_b.shuffle_product_commits.iter()) {
+            assert_eq!(a.0, b.0, "shuffle product commit mismatch");
+        }
+        assert_eq!(proof_a.shuffle_evals, proof_b.shuffle_evals);
+        assert_eq!(proof_a.opening_proof_w.0, proof_b.opening_proof_w.0);
+        assert_eq!(proof_a.opening_proof_w_prime.0, proof_b.opening_proof_w_prime.0);
+    }
+
+    /// `parse_proof_no_fs` honours the same strict-canonical Fr check as
+    /// `read_proof`. A non-canonical scalar (≥ Fr modulus) → InvalidProofEncoding.
+    #[test]
+    fn parse_proof_no_fs_rejects_noncanonical_fr() {
+        // Synthesize a proof of all zero G1 (size matches a tiny VK) and one
+        // Fr that's >= modulus.
+        let vk = zero_vk(0, 0, 2);
+        // Layout: 0 advice + 1 perm + 1 random + 1 h = 3 G1 = 192 B
+        //   + 0 advice_evals + 0 fixed_evals + 1 random_eval
+        //   + 1 perm_common + 2 perm-product = 4 Fr = 128 B
+        //   + 2 W openings = 128 B
+        //   total = 448 B
+        let mut proof = alloc::vec![0u8; expected_proof_size(&vk)];
+        assert_eq!(proof.len(), 448);
+        // random_poly_eval is the FIRST scalar — at offset 192 (after 3 G1).
+        proof[192..192 + 32].copy_from_slice(&[
+            0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29,
+            0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+            0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91,
+            0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
+        ]);
+        let r = parse_proof_no_fs(&vk, &proof);
+        assert!(matches!(r, Err(Error::PublicInputOutOfRange)));
     }
 }

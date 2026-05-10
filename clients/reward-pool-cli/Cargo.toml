@@ -1,0 +1,24 @@
+[package]
+name        = "reward-pool-cli"
+version     = "0.1.0"
+description = "Phase 2 demo CLI: ZK-gated reward pool — init / claim / close on devnet"
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "reward-pool-cli"
+path = "src/main.rs"
+
+[dependencies]
+solana-client                    = "3"
+solana-sdk                       = "3"
+solana-commitment-config         = "3"
+solana-compute-budget-interface  = "3"
+solana-program                   = { workspace = true }
+solana-system-interface          = { version = "3", features = ["bincode"] }
+sha3                             = "0.10"
+range-check-circuit              = { path = "../../circuits/range-check" }
+ark-bn254                        = { workspace = true, features = ["std"] }
+hex                              = { workspace = true, features = ["std"] }
+anyhow                           = "1"

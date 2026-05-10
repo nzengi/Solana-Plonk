@@ -1,0 +1,22 @@
+[package]
+name        = "reward-pool"
+version     = "0.1.0"
+description = "Phase 2 demo: ZK-gated SOL reward pool. CPI's into halo2-solana-verifier-program for proof validation."
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+bpf-entrypoint = []
+
+[dependencies]
+solana-program          = { workspace = true }
+solana-system-interface = { version = "3", features = ["bincode"] }
+
+[dev-dependencies]
+mollusk-svm    = { workspace = true }
+solana-program = { workspace = true }

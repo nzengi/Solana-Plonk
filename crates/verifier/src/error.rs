@@ -19,6 +19,13 @@ pub enum Error {
     /// Gate-AST bytecode failed to parse / evaluate (truncated, OOB index,
     /// stack underflow, unknown opcode, non-singleton stack at end).
     InvalidGateBytecode,
+    /// 2-tx split: the Stage1Output bytes in the PDA are malformed,
+    /// have the wrong magic / version, or contain out-of-range counts.
+    InvalidStageState,
+    /// 2-tx split: the replay-binding hash in the PDA does not match
+    /// the values re-computed from the data account at stage2 time
+    /// (someone tampered with the data account between txs).
+    StageReplayMismatch,
 }
 
 impl fmt::Display for Error {
@@ -33,6 +40,8 @@ impl fmt::Display for Error {
             Error::ComputeBudgetExhausted    => f.write_str("compute budget exhausted"),
             Error::Protocol(msg)             => write!(f, "protocol error: {msg}"),
             Error::InvalidGateBytecode       => f.write_str("invalid gate bytecode"),
+            Error::InvalidStageState         => f.write_str("invalid 2-tx stage state"),
+            Error::StageReplayMismatch       => f.write_str("2-tx stage replay binding mismatch"),
         }
     }
 }

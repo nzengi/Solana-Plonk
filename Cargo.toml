@@ -11,9 +11,12 @@ members = [
     "circuits/shuffle-check",
     "circuits/challenge-check",
     "circuits/multi-lookup-check",
+    "circuits/bound-range-check",
     "programs/verifier-program",
     "programs/g1-msm-bench",
+    "programs/reward-pool",
     "clients/devnet-send",
+    "clients/reward-pool-cli",
 ]
 
 [workspace.package]
