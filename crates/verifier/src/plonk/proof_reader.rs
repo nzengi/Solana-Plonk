@@ -229,7 +229,7 @@ mod tests {
             num_perm_chunks: 1,
             fixed_commitments: Vec::new(),
             permutation_commitments: alloc::vec![G1::IDENTITY], // 1 perm column
-            transcript_repr: [0u8; 32],
+            transcript_repr: [0u8; 32], ..Default::default()
         }
     }
 
@@ -267,7 +267,7 @@ mod tests {
             num_perm_chunks: 1,
             fixed_commitments: alloc::vec![G1::IDENTITY],
             permutation_commitments: alloc::vec![G1::IDENTITY],
-            transcript_repr: [0u8; 32],
+            transcript_repr: [0u8; 32], ..Default::default()
         };
 
         // Proof composition (zeros are fine — no on-curve check in reader):
@@ -362,7 +362,7 @@ mod tests {
             num_perm_chunks: 1,
             fixed_commitments: Vec::new(),
             permutation_commitments: alloc::vec![G1::IDENTITY; 3],
-            transcript_repr: [0u8; 32],
+            transcript_repr: [0u8; 32], ..Default::default()
         };
         // G1 = 3 advice + 1 perm + 1 random + 3 h + 2 W = 10 → 640 B
         // Fr = 3 advice_evals + 5 fixed_evals + 1 random_eval

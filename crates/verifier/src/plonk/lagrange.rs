@@ -99,6 +99,77 @@ fn accumulate_blinded_lagrange(
     Ok((l_blind, omega_inv_pow_i))
 }
 
+/// Compute one Lagrange basis evaluation `L_i(x) = ωⁱ · (xⁿ − 1) / (n · (x − ωⁱ))`
+/// where `i` may be negative (use `ω⁻¹` then). Returns `Err` if `x = ωⁱ`.
+#[inline]
+pub fn lagrange_basis_at(
+    i: i64,
+    omega: Fr,
+    x: Fr,
+    xn_minus_one: Fr,
+    n_inv: Fr,
+) -> Result<Fr, Error> {
+    let omega_pow_i = if i >= 0 {
+        pow_u64(omega, i as u64)
+    } else {
+        let omega_inv = omega.inverse()
+            .ok_or(Error::Protocol("lagrange_basis_at: omega inverse"))?;
+        pow_u64(omega_inv, (-i) as u64)
+    };
+    let denom = (x - omega_pow_i).inverse()
+        .ok_or(Error::Protocol("lagrange_basis_at: x equals ω^i (domain point)"))?;
+    Ok(omega_pow_i * xn_minus_one * n_inv * denom)
+}
+
+/// Reconstruct each instance-column query's evaluation at challenge `x`
+/// from the public inputs, mirroring halo2's `verify_proof` for the
+/// `QUERY_INSTANCE = false` path:
+///
+/// ```text
+/// instance_eval[q] = Σⱼ instance[col[q]][j] · L_{j - rotation[q]}(x)
+/// ```
+///
+/// `instance_queries` is `vk.instance_queries` (column_index, rotation).
+/// `public_inputs` is one per instance column; each inner Vec is the
+/// column's values at successive rows. Empty input maps to empty output.
+#[inline(never)]
+pub fn reconstruct_instance_evals(
+    k: u32,
+    omega: Fr,
+    x: Fr,
+    instance_queries: &[(u32, i32)],
+    public_inputs: &[alloc::vec::Vec<Fr>],
+) -> Result<alloc::vec::Vec<Fr>, Error> {
+    if instance_queries.is_empty() {
+        return Ok(alloc::vec::Vec::new());
+    }
+    let n_u64: u64 = 1u64 << k;
+    let n_inv = Fr::from(n_u64).inverse()
+        .ok_or(Error::Protocol("reconstruct_instance_evals: n inverse"))?;
+    let xn = pow_u64(x, n_u64);
+    let xn_minus_one = xn - Fr::ONE;
+
+    let mut out = alloc::vec::Vec::with_capacity(instance_queries.len());
+    for (col_index, rotation) in instance_queries {
+        let column_values = public_inputs.get(*col_index as usize)
+            .ok_or(Error::Protocol("reconstruct_instance_evals: column out of range"))?;
+        let mut acc = Fr::ZERO;
+        for (j, value) in column_values.iter().enumerate() {
+            // halo2 evaluates instance polynomial at row j, then queries at
+            // rotation r → result is the polynomial value at row (j - r) on
+            // the rotated polynomial. Equivalently:
+            //   value · L_{j - rotation}(x)
+            let basis = lagrange_basis_at(
+                j as i64 - *rotation as i64,
+                omega, x, xn_minus_one, n_inv,
+            )?;
+            acc += *value * basis;
+        }
+        out.push(acc);
+    }
+    Ok(out)
+}
+
 #[inline(never)]
 fn pow_u64(mut base: Fr, mut exp: u64) -> Fr {
     let mut acc = Fr::ONE;

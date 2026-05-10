@@ -1624,6 +1624,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "fibonacci-circuit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-bn254 0.5.0",
+ "ark-serialize 0.5.0",
+ "halo2-solana-verifier",
+ "halo2-solana-vk-host",
+ "halo2_proofs",
+ "halo2curves",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "standard-plonk-circuit",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

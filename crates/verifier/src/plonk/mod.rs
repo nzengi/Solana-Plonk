@@ -5,6 +5,7 @@
 //! no shuffles, no challenges-in-phases, single permutation chunk, queries
 //! at rotation 0 only). Generic gate-expression AST evaluation is v1.5.
 
+pub mod expression;
 pub mod lagrange;
 pub mod permutation;
 pub mod proof_reader;
@@ -16,6 +17,10 @@ use ark_bn254::Fr;
 use crate::curve::G1;
 
 /// On-chain flattened representation of a Halo2 verifying key.
+///
+/// v1.5 extensions over v1: query-column metadata + gate AST bytecode +
+/// permutation column type tags. v1's hard-coded StandardPlonk gate is
+/// replaced by a generic bytecode evaluator (see `plonk::expression`).
 #[derive(Clone, Debug)]
 pub struct PlonkProtocol {
     pub k: u32,                       // log2 of circuit rows
@@ -27,11 +32,32 @@ pub struct PlonkProtocol {
     pub cs_degree: usize,             // ConstraintSystem::degree()
     pub num_advice_queries: usize,    // total advice column queries (sum over rotations)
     pub num_fixed_queries: usize,
+    pub num_instance_queries: usize,  // v1.5: instance column queries
+    pub num_challenges: usize,        // v1.5: user-defined phase challenges
     pub blinding_factors: usize,      // # of last rows reserved for blinders
     pub num_perm_chunks: usize,       // ceil(num_perm_columns / chunk_len)
 
     pub fixed_commitments: Vec<G1>,
     pub permutation_commitments: Vec<G1>,
+
+    /// v1.5: query-column metadata. Each entry is `(column_index, rotation)`.
+    /// Index in this Vec matches the `query.index` halo2 stores in its
+    /// `Expression::{Advice, Fixed, Instance}` variants → so the bytecode
+    /// evaluator can look up `proof.{advice,fixed,instance}_evals[idx]`
+    /// directly.
+    pub advice_queries:   Vec<(u32, i32)>,
+    pub fixed_queries:    Vec<(u32, i32)>,
+    pub instance_queries: Vec<(u32, i32)>,
+
+    /// v1.5: gate constraint bytecode. Outer Vec = one entry per
+    /// `vk.cs.gates[i]`; inner Vec = one entry per `gate.polynomials()[j]`;
+    /// innermost is the RPN bytecode evaluated by `plonk::expression::evaluate`.
+    pub gates: Vec<Vec<Vec<u8>>>,
+
+    /// v1.5: permuted column types. Each entry is `(col_type, query_index)`
+    /// where `col_type ∈ {0=advice, 1=fixed, 2=instance}` and `query_index`
+    /// indexes into the matching `*_queries` list above.
+    pub permuted_columns: Vec<(u8, u32)>,
 
     /// Pre-computed Blake2b("Halo2-Verify-Key" || …) → `transcript_repr`.
     /// Computed off-chain by the VK compiler so the on-chain verifier never
@@ -42,6 +68,36 @@ pub struct PlonkProtocol {
 impl PlonkProtocol {
     pub fn num_perm_columns(&self) -> usize {
         self.permutation_commitments.len()
+    }
+}
+
+#[cfg(any(test, feature = "std"))]
+impl Default for PlonkProtocol {
+    /// Synthetic empty VK — only useful for unit tests that need a placeholder.
+    fn default() -> Self {
+        use ark_ff::AdditiveGroup;
+        Self {
+            k: 0,
+            omega: Fr::ZERO,
+            num_instance: 0,
+            num_advice: 0,
+            num_fixed: 0,
+            cs_degree: 0,
+            num_advice_queries: 0,
+            num_fixed_queries: 0,
+            num_instance_queries: 0,
+            num_challenges: 0,
+            blinding_factors: 0,
+            num_perm_chunks: 0,
+            fixed_commitments: Vec::new(),
+            permutation_commitments: Vec::new(),
+            advice_queries: Vec::new(),
+            fixed_queries: Vec::new(),
+            instance_queries: Vec::new(),
+            gates: Vec::new(),
+            permuted_columns: Vec::new(),
+            transcript_repr: [0u8; 32],
+        }
     }
 }
 

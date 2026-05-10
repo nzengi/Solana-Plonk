@@ -16,6 +16,9 @@ pub enum Error {
     ComputeBudgetExhausted,
     /// Generic protocol/transcript error from the vendored verifier core.
     Protocol(&'static str),
+    /// Gate-AST bytecode failed to parse / evaluate (truncated, OOB index,
+    /// stack underflow, unknown opcode, non-singleton stack at end).
+    InvalidGateBytecode,
 }
 
 impl fmt::Display for Error {
@@ -29,6 +32,7 @@ impl fmt::Display for Error {
             Error::PairingCheckFailed        => f.write_str("pairing check failed"),
             Error::ComputeBudgetExhausted    => f.write_str("compute budget exhausted"),
             Error::Protocol(msg)             => write!(f, "protocol error: {msg}"),
+            Error::InvalidGateBytecode       => f.write_str("invalid gate bytecode"),
         }
     }
 }

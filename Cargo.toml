@@ -5,6 +5,7 @@ members = [
     "crates/vk-host",
     "crates/g1-msm-ref",
     "circuits/standard-plonk",
+    "circuits/fibonacci",
     "programs/verifier-program",
     "programs/g1-msm-bench",
     "clients/devnet-send",

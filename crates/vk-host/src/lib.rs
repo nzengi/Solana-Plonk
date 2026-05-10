@@ -24,5 +24,6 @@
 
 pub mod compile;
 pub mod encode;
+pub mod expression_encoder;
 
 pub use compile::{compile_vk, Error};

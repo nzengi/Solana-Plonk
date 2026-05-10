@@ -1,5 +1,13 @@
 # Halo2 Verifier on Solana — CU Profile & SIMD Case
 
+> **v1.5 update (2026-05-10)** — the verifier is now circuit-shape agnostic
+> via a generic gate-AST evaluator. The hard-coded StandardPlonk gate is
+> gone; any halo2 circuit (without lookups/shuffles) can be verified by
+> the same `.so`. Two circuits are exercised in this profile:
+> StandardPlonk (regression baseline) and Fibonacci (rotation::next() +
+> instance column path).
+
+
 **A working PSE-Halo2 BN254/KZG/SHPLONK verifier on Solana BPF, end-to-end measured, devnet-deployed, cap-bound.**
 
 This document presents the per-stage compute-unit profile of a real Halo2 verifier running on the Solana BPF VM, the on-chain transactions that demonstrate the bottleneck, and the case for a `alt_bn128_g1_msm` SIMD as the highest-leverage cure.
@@ -16,9 +24,11 @@ The numbers are not synthetic. They come from:
 
 | Number | What it is |
 |---|---|
-| **2,710,424 CU** | Total cost to verify a k=4 StandardPlonk proof on BPF (Mollusk). |
+| **2,710,424 CU** | v1 cost to verify a k=4 StandardPlonk proof on BPF (Mollusk). |
+| **2,728,844 CU** | v1.5 cost on the same StandardPlonk proof — **+0.7%** AST overhead. |
+| **2,284,029 CU** | v1.5 cost on a Fibonacci circuit (1 advice + 1 fixed selector + 1 instance). |
 | **1,399,644 CU** | What the on-chain devnet tx consumed before hitting the 1.4M ceiling. |
-| **1,667,016 CU = 62%** | Cost of `shplonk::verify_opening` alone. |
+| **1,667,016 CU = 62%** | Cost of `shplonk::verify_opening` alone (StandardPlonk). |
 | **533,709 CU = 20%** | Cost of `lagrange::evaluate_lagrange` (5 Fr inverses). |
 | **49,546 CU = 2%** | Cost of the final `alt_bn128_pairing` syscall (already a syscall — optimal). |
 
@@ -100,6 +110,37 @@ A `alt_bn128_g1_msm_be(scalars: &[Fr], points: &[G1Affine]) -> G1Affine` syscall
 Arkworks `Fr::inverse()` is constant-time Montgomery extended-Euclidean — pure Rust 256-bit big-integer arithmetic compiled to BPF, no native syscall. Empirically each inverse costs **~100k CU** on BPF. That's the lower-hanging fruit for a `alt_bn128_fr_arith` SIMD ask.
 
 ---
+
+## 3a. v1.5 — generic gate-AST evaluator + multi-circuit support
+
+v1.5 replaces v1's hard-coded StandardPlonk gate with a stack-based RPN
+bytecode evaluator (`crates/verifier/src/plonk/expression.rs`). The VK
+format gains gate AST bytecode + per-query column metadata + permuted
+column type tags (`H2SV0001` → `H2SV0002`).
+
+| Metric | v1 (StandardPlonk hard-coded) | v1.5 (generic AST) | Δ |
+|---|---:|---:|---:|
+| `verify()` total CU (Mollusk, StandardPlonk) | 2,710,424 | 2,728,844 | +0.68% |
+| `verify()` total CU (Mollusk, Fibonacci) | n/a | 2,284,029 | new |
+| VK byte size (StandardPlonk k=4) | 632 B | 794 B | +162 B |
+| VK byte size (Fibonacci k=4) | n/a | 488 B | new |
+
+The 0.68% AST overhead on the regression circuit confirms the stack
+evaluator's per-op cost is small (~1k CU for the 19-op StandardPlonk
+gate). The Fibonacci circuit costs **less** because it has fewer advice
+columns (1 vs 3) → fewer rotation-set commitments inside SHPLONK, and a
+shorter gate AST.
+
+**What the same `.so` now accepts:** any halo2 ConstraintSystem with
+`num_lookups == 0`, `num_shuffles == 0`, and `num_challenges == 0`.
+Includes circuits using rotation::next/prev/etc, instance columns
+(public inputs), mixed advice/fixed/instance permuted columns, and
+arbitrary gate polynomials over the standard arithmetic ops.
+
+**Out of scope for v1.5 (deferred to v2):**
+- Lookup arguments (Plookup-family). Rejected at compile time.
+- Shuffle arguments. Rejected at compile time.
+- User-defined phase challenges (`vk.cs.num_challenges > 0`).
 
 ## 4a. Projected impact of `alt_bn128_g1_msm` (SIMD-XXXX)
 

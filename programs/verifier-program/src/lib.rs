@@ -53,7 +53,7 @@ pub const LOAD_TAG:   u8 = 0x01;
 /// Parse the on-chain instruction-data layout into the inputs `verify()` needs.
 /// `no_std`-friendly; allocations only happen inside `verify()`'s temporaries.
 fn parse_instruction(data: &[u8])
-    -> Result<(&[u8], &[u8], KzgVk), u32>
+    -> Result<(&[u8], &[u8], KzgVk, alloc::vec::Vec<[u8; 32]>), u32>
 {
     if data.len() < 8 + 4 || &data[..8] != MAGIC {
         return Err(errors::MALFORMED_INPUT);
@@ -91,16 +91,31 @@ fn parse_instruction(data: &[u8])
     g2_tau_bytes.copy_from_slice(&data[cur..cur + G2_LEN]);
     cur += G2_LEN;
 
-    // Reject trailing bytes (public inputs unsupported in v1).
-    if cur != data.len() {
-        return Err(errors::MALFORMED_INPUT);
-    }
+    // v1.5: optional public-inputs suffix `[n_pi: u32 LE | pi: 32 B × n_pi]`.
+    // v1.0 payloads (no PIs) end exactly here; we treat both layouts as valid.
+    let public_inputs: alloc::vec::Vec<[u8; 32]> = if cur == data.len() {
+        alloc::vec::Vec::new()
+    } else {
+        let n_pi = read_u32_le(data, &mut cur)? as usize;
+        let want = n_pi.checked_mul(32).ok_or(errors::MALFORMED_INPUT)?;
+        if cur.checked_add(want).map_or(true, |e| e != data.len()) {
+            return Err(errors::MALFORMED_INPUT);
+        }
+        let mut pis = alloc::vec::Vec::with_capacity(n_pi);
+        for _ in 0..n_pi {
+            let mut pi = [0u8; 32];
+            pi.copy_from_slice(&data[cur..cur + 32]);
+            pis.push(pi);
+            cur += 32;
+        }
+        pis
+    };
 
     Ok((vk_bytes, proof_bytes, KzgVk {
         g1_one: G1(g1_one_bytes),
         g2_one: G2(g2_one_bytes),
         g2_tau: G2(g2_tau_bytes),
-    }))
+    }, public_inputs))
 }
 
 #[inline]
@@ -131,38 +146,35 @@ pub fn run(instruction_data: &[u8]) -> Result<(), u32> {
     }
     #[allow(unreachable_code)]
     {
-        let (vk_bytes, proof_bytes, kzg_vk) = parse_instruction(instruction_data)?;
+        let (vk_bytes, proof_bytes, kzg_vk, public_inputs) = parse_instruction(instruction_data)?;
 
         #[cfg(feature = "probe-parse-vk")]
         {
-            // Stop after parse_vk — isolates VK parsing as a possible offender.
             let _ = halo2_solana_verifier::vk::parse_vk(vk_bytes)
                 .map_err(|_| errors::VERIFIER_ERROR)?;
-            let _ = (proof_bytes, kzg_vk);
+            let _ = (proof_bytes, kzg_vk, &public_inputs);
             return Ok(());
         }
 
         #[cfg(feature = "probe-read-proof")]
         {
-            // Stop after parse_vk + read_proof. Tests transcript Keccak path.
             let vk = halo2_solana_verifier::vk::parse_vk(vk_bytes)
                 .map_err(|_| errors::VERIFIER_ERROR)?;
             let mut transcript =
                 halo2_solana_verifier::transcript::Keccak256Transcript::new(&vk.transcript_repr);
             let _ = halo2_solana_verifier::proof_reader::read_proof(
-                &vk, proof_bytes, &[], &mut transcript,
+                &vk, proof_bytes, &public_inputs, &mut transcript,
             ).map_err(|_| errors::VERIFIER_ERROR)?;
             let _ = kzg_vk;
             return Ok(());
         }
 
         #[cfg(feature = "stage-trace")]
-        return run_traced(vk_bytes, proof_bytes, kzg_vk);
+        return run_traced(vk_bytes, proof_bytes, kzg_vk, public_inputs);
 
         // Default: full verify.
         #[allow(unreachable_code)]
         {
-            let public_inputs: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::new();
             match verify(vk_bytes, proof_bytes, &public_inputs, &kzg_vk) {
                 Ok(true)  => Ok(()),
                 Ok(false) => Err(errors::VERIFIER_REJECTED),
@@ -181,6 +193,7 @@ fn run_traced(
     vk_bytes: &[u8],
     proof_bytes: &[u8],
     kzg_vk: KzgVk,
+    public_inputs: alloc::vec::Vec<[u8; 32]>,
 ) -> Result<(), u32> {
     use halo2_solana_verifier::{
         plonk::{lagrange, permutation, verifier as v, PlonkProof, PlonkProtocol, Challenges},
@@ -204,7 +217,6 @@ fn run_traced(
     cu("[stage] after parse_vk");
 
     let mut transcript = Keccak256Transcript::new(&vk.transcript_repr);
-    let public_inputs: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::new();
     let (proof, ch): (PlonkProof, Challenges) = proof_reader::read_proof(
         &vk, proof_bytes, &public_inputs, &mut transcript,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
@@ -214,8 +226,29 @@ fn run_traced(
         .map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after lagrange");
 
-    let expected_h_eval = v::compute_expected_h_eval(&vk, &proof, &ch, &lag)
-        .map_err(|_| errors::VERIFIER_ERROR)?;
+    // Reconstruct instance_evals from public_inputs (one-column shorthand
+    // for v1.5 PoC; multi-column instance circuits would need a richer layout).
+    let instance_evals: alloc::vec::Vec<ark_bn254::Fr> = if vk.num_instance == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        let mut col0 = alloc::vec::Vec::with_capacity(public_inputs.len());
+        for raw in &public_inputs {
+            col0.push(halo2_solana_verifier::field::fr_from_bytes_be(raw)
+                .map_err(|_| errors::VERIFIER_ERROR)?);
+        }
+        let mut cols: alloc::vec::Vec<alloc::vec::Vec<ark_bn254::Fr>> = alloc::vec::Vec::new();
+        cols.push(col0);
+        for _ in 1..vk.num_instance {
+            cols.push(alloc::vec::Vec::new());
+        }
+        lagrange::reconstruct_instance_evals(
+            vk.k, vk.omega, ch.x, &vk.instance_queries, &cols,
+        ).map_err(|_| errors::VERIFIER_ERROR)?
+    };
+    let user_challenges: alloc::vec::Vec<ark_bn254::Fr> = alloc::vec::Vec::new();
+    let expected_h_eval = v::compute_expected_h_eval(
+        &vk, &proof, &ch, &lag, &instance_evals, &user_challenges,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after expected_h_eval");
     let _ = expected_h_eval; // silence warnings on unused tail values
 
@@ -340,7 +373,8 @@ mod tests {
             g2_tau: G2([5u8; 128]),
         };
         let buf = build_instruction(&vk, &proof, &kzg);
-        let (got_vk, got_proof, got_kzg) = parse_instruction(&buf).unwrap();
+        let (got_vk, got_proof, got_kzg, got_pis) = parse_instruction(&buf).unwrap();
+        assert!(got_pis.is_empty(), "v1 layout has no PI suffix");
         assert_eq!(got_vk, vk.as_slice());
         assert_eq!(got_proof, proof.as_slice());
         assert_eq!(got_kzg.g1_one.0, kzg.g1_one.0);

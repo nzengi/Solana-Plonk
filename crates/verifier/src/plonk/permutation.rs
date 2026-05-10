@@ -34,6 +34,9 @@ use crate::{
 
 /// Compute the permutation argument's constraint contributions at challenge `x`.
 ///
+/// v1.5: takes `instance_evals` because permuted columns can include
+/// instance columns. Empty slice is fine for advice-only circuits.
+///
 /// `#[inline(never)]` keeps this large function out of the caller's BPF stack
 /// frame — inlining into `verify()` pushes the combined frame past the
 /// 4096-byte SBF limit.
@@ -43,6 +46,7 @@ pub fn expressions(
     proof: &PlonkProof,
     ch:    &Challenges,
     lag:   &LagrangeEvaluations,
+    instance_evals: &[Fr],
 ) -> Result<Vec<Fr>, Error> {
     let chunk_len = vk.cs_degree.saturating_sub(2).max(1);
     let num_perm_cols = vk.num_perm_columns();
@@ -56,12 +60,10 @@ pub fn expressions(
     if proof.permutation_common_evals.len() != num_perm_cols {
         return Err(Error::Protocol("perm: common eval count mismatch"));
     }
-    // v1 assumption: permuted columns are advice[0..num_perm_cols].
-    if num_perm_cols > vk.num_advice {
-        return Err(Error::Protocol("perm: more perm cols than advice cols (v1.5 generalisation needed)"));
-    }
-    if proof.advice_evals.len() < num_perm_cols {
-        return Err(Error::Protocol("perm: advice_evals shorter than num_perm_cols"));
+    // v1.5: permuted_columns may mix advice/fixed/instance — VK records the
+    // type tag + query index for each. v1 hard-coded "advice[0..N)".
+    if vk.permuted_columns.len() != num_perm_cols {
+        return Err(Error::Protocol("perm: permuted_columns count mismatch"));
     }
 
     let mut out: Vec<Fr> = Vec::new();
@@ -91,10 +93,12 @@ pub fn expressions(
 
     for i in 0..vk.num_perm_chunks {
         let contribution = chunk_grand_product(
-            i, chunk_len, num_perm_cols, &proof.advice_evals,
+            i, chunk_len, num_perm_cols,
+            &vk.permuted_columns,
+            &proof.advice_evals, &proof.fixed_evals, instance_evals,
             &proof.permutation_common_evals, &proof.permutation_product_evals,
             ch.beta, ch.gamma, ch.x, delta,
-        );
+        )?;
         out.push(active * contribution);
     }
 
@@ -103,38 +107,68 @@ pub fn expressions(
 
 /// One chunk's grand-product contribution `left − right`. Lives in its own
 /// stack frame to keep `expressions`'s frame under the 4096-byte BPF limit.
+///
+/// v1.5: each permuted column carries a `(col_type, query_index)` tag so the
+/// per-column eval is fetched from the right evals array (advice / fixed /
+/// instance) rather than assumed to be `advice[j]`.
 #[inline(never)]
 fn chunk_grand_product(
     i: usize,
     chunk_len: usize,
     num_perm_cols: usize,
+    permuted_columns: &[(u8, u32)],
     advice_evals: &[Fr],
+    fixed_evals: &[Fr],
+    instance_evals: &[Fr],
     perm_common_evals: &[Fr],
     perm_prod_evals: &[(Fr, Fr, Fr)],
     beta: Fr,
     gamma: Fr,
     x: Fr,
     delta: Fr,
-) -> Fr {
+) -> Result<Fr, Error> {
     let (z, z_omega, _z_last) = perm_prod_evals[i];
     let col_start = i * chunk_len;
     let col_end   = (col_start + chunk_len).min(num_perm_cols);
 
-    // left = z(ωx) · ∏ (advice_eval + β · σ_eval + γ)
+    // left = z(ωx) · ∏ (column_eval + β · σ_eval + γ)
     let mut left = z_omega;
     for j in col_start..col_end {
-        left *= advice_evals[j] + beta * perm_common_evals[j] + gamma;
+        let col_eval = lookup_column_eval(
+            permuted_columns[j], advice_evals, fixed_evals, instance_evals,
+        )?;
+        left *= col_eval + beta * perm_common_evals[j] + gamma;
     }
 
-    // right = z(x) · ∏ (advice_eval + δⁱ · β · x + γ)
-    // current_delta = δ^(i·chunk_len) · β · x → multiplied by δ each loop
+    // right = z(x) · ∏ (column_eval + δⁱ · β · x + γ)
     let mut current_delta = pow_fr(delta, (i * chunk_len) as u64) * beta * x;
     let mut right = z;
     for j in col_start..col_end {
-        right *= advice_evals[j] + current_delta + gamma;
+        let col_eval = lookup_column_eval(
+            permuted_columns[j], advice_evals, fixed_evals, instance_evals,
+        )?;
+        right *= col_eval + current_delta + gamma;
         current_delta *= delta;
     }
-    left - right
+    Ok(left - right)
+}
+
+/// Resolve a permuted column's evaluation by type tag + query index.
+/// `col_type ∈ {0=advice, 1=fixed, 2=instance}`.
+#[inline]
+fn lookup_column_eval(
+    (col_type, query_index): (u8, u32),
+    advice: &[Fr], fixed: &[Fr], instance: &[Fr],
+) -> Result<Fr, Error> {
+    let idx = query_index as usize;
+    let evals: &[Fr] = match col_type {
+        0 => advice,
+        1 => fixed,
+        2 => instance,
+        _ => return Err(Error::Protocol("perm: invalid permuted column type")),
+    };
+    evals.get(idx).copied()
+        .ok_or(Error::Protocol("perm: permuted column eval out of range"))
 }
 
 #[inline(never)]
@@ -154,6 +188,11 @@ mod tests {
     use crate::curve::G1;
 
     fn synth_vk(num_advice: usize, num_perm_columns: usize, cs_degree: usize, num_perm_chunks: usize) -> PlonkProtocol {
+        // v1.5: permuted_columns must be supplied; mock all-advice with
+        // sequential query indices [0, 1, …].
+        let permuted_columns: Vec<(u8, u32)> = (0..num_perm_columns as u32)
+            .map(|i| (0u8, i)) // 0 = advice
+            .collect();
         PlonkProtocol {
             k: 4,
             omega: Fr::ONE,
@@ -167,7 +206,8 @@ mod tests {
             num_perm_chunks,
             fixed_commitments: Vec::new(),
             permutation_commitments: alloc::vec![G1::IDENTITY; num_perm_columns],
-            transcript_repr: [0u8; 32],
+            permuted_columns,
+            transcript_repr: [0u8; 32], ..Default::default()
         }
     }
 
@@ -218,7 +258,7 @@ mod tests {
         let proof = synth_proof_one_chunk(1, 1);
         let ch = synth_ch();
         let lag = synth_lag();
-        let exprs = expressions(&vk, &proof, &ch, &lag).unwrap();
+        let exprs = expressions(&vk, &proof, &ch, &lag, &[]).unwrap();
         assert_eq!(exprs.len(), 3, "1 init + 1 final + 1 grand-product");
     }
 
@@ -232,7 +272,7 @@ mod tests {
             (Fr::from(43u64), Fr::from(47u64), Fr::from(53u64)),
         ];
         proof.permutation_product_commits = alloc::vec![G1::IDENTITY; 2];
-        let exprs = expressions(&vk, &proof, &synth_ch(), &synth_lag()).unwrap();
+        let exprs = expressions(&vk, &proof, &synth_ch(), &synth_lag(), &[]).unwrap();
         assert_eq!(exprs.len(), 5);
     }
 
@@ -242,7 +282,7 @@ mod tests {
         let vk = synth_vk(1, 1, 3, 1);
         let proof = synth_proof_one_chunk(1, 1);
         let lag = synth_lag(); // l_0 = 2
-        let exprs = expressions(&vk, &proof, &synth_ch(), &lag).unwrap();
+        let exprs = expressions(&vk, &proof, &synth_ch(), &lag, &[]).unwrap();
         // expected = 2 · (1 - 31)
         let expected = Fr::from(2u64) * (Fr::ONE - Fr::from(31u64));
         assert_eq!(exprs[0], expected);
@@ -254,27 +294,22 @@ mod tests {
         let vk = synth_vk(1, 1, 3, 1);
         let proof = synth_proof_one_chunk(1, 1);
         let lag = synth_lag(); // l_last = 3
-        let exprs = expressions(&vk, &proof, &synth_ch(), &lag).unwrap();
+        let exprs = expressions(&vk, &proof, &synth_ch(), &lag, &[]).unwrap();
         // z = 31, z² − z = 31·31 − 31 = 961 − 31 = 930
         let expected = Fr::from(3u64) * Fr::from(930u64);
         assert_eq!(exprs[1], expected);
     }
 
-    /// Rejects when num_perm_cols > num_advice (our v1 assumption violated).
-    #[test]
-    fn expressions_rejects_unsupported_column_kind() {
-        let vk = synth_vk(1, 2, 3, 1); // 1 advice, 2 perm cols → invalid v1
-        let proof = synth_proof_one_chunk(1, 2);
-        let r = expressions(&vk, &proof, &synth_ch(), &synth_lag());
-        assert!(matches!(r, Err(Error::Protocol(_))));
-    }
+    // The v1 "permuted columns must be advice[0..N)" check was removed in
+    // v1.5 — `permuted_columns` now carries explicit (col_type, query_index)
+    // tags so mixed advice/fixed/instance perm columns are accepted.
 
     /// Rejects when chunk count in proof disagrees with VK metadata.
     #[test]
     fn expressions_rejects_chunk_mismatch() {
         let vk = synth_vk(1, 1, 3, 2);                    // VK says 2 chunks
         let proof = synth_proof_one_chunk(1, 1);          // proof has 1 chunk
-        let r = expressions(&vk, &proof, &synth_ch(), &synth_lag());
+        let r = expressions(&vk, &proof, &synth_ch(), &synth_lag(), &[]);
         assert!(matches!(r, Err(Error::Protocol(_))));
     }
 
@@ -290,7 +325,7 @@ mod tests {
             permutation_product_commits: Vec::new(),
             ..proof
         };
-        let exprs = expressions(&vk, &proof, &synth_ch(), &synth_lag()).unwrap();
+        let exprs = expressions(&vk, &proof, &synth_ch(), &synth_lag(), &[]).unwrap();
         assert!(exprs.is_empty());
     }
 }

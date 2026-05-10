@@ -15,61 +15,45 @@ use crate::{
     field::fr_to_bytes_be,
     kzg::{shplonk, shplonk::VerifierQuery, KzgVk},
     pairing,
-    plonk::{lagrange, permutation, Challenges, PlonkProof, PlonkProtocol},
+    plonk::{expression, lagrange, permutation, Challenges, PlonkProof, PlonkProtocol},
     proof_reader,
     transcript::Keccak256Transcript,
     vk::parse_vk,
     Error,
 };
 
-/// StandardPlonk gate identity column ordering convention.
-///
-/// fixed columns: `[q_a, q_b, q_c, q_ab, q_const]`
-/// advice columns: `[a, b, c]`
-/// Single permutation set over all advice columns.
-///
-/// These constants are exposed for the prover (task #8) so the off-chain
-/// circuit can be constructed with the matching column layout.
-pub mod standard_plonk {
-    pub const Q_A:     usize = 0;
-    pub const Q_B:     usize = 1;
-    pub const Q_C:     usize = 2;
-    pub const Q_AB:    usize = 3;
-    pub const Q_CONST: usize = 4;
-    pub const NUM_FIXED:  usize = 5;
+/// (Removed in v1.5) StandardPlonk-specific column ordering constants.
+/// The verifier now reads gate identities from VK byte-code instead of
+/// hard-coding any one circuit shape.
 
-    pub const A: usize = 0;
-    pub const B: usize = 1;
-    pub const C: usize = 2;
-    pub const NUM_ADVICE: usize = 3;
-}
-
-/// Evaluate the StandardPlonk gate identity at challenge `x`.
+/// Evaluate every gate's polynomials at the current challenge / eval state
+/// using the generic RPN bytecode evaluator (v1.5).
 ///
-/// Returns a single-element vector — halo2's general API returns a Vec of
-/// per-gate, per-row expressions; we keep the same shape so the y-fold logic
-/// generalises trivially in v1.5.
+/// The output is the flat list halo2's vanishing argument expects, in
+/// `gates[0].polynomials[0]`, `gates[0].polynomials[1]`, …,
+/// `gates[1].polynomials[0]`, … order — the same iteration order halo2's
+/// `verify_proof` uses when folding with `y`.
 #[inline(never)]
-pub fn gate_standard_plonk(proof: &PlonkProof) -> Result<Vec<Fr>, Error> {
-    use standard_plonk::*;
-    if proof.advice_evals.len() < NUM_ADVICE {
-        return Err(Error::Protocol("gate: advice_evals shorter than NUM_ADVICE"));
-    }
-    if proof.fixed_evals.len() < NUM_FIXED {
-        return Err(Error::Protocol("gate: fixed_evals shorter than NUM_FIXED"));
-    }
-    let a = proof.advice_evals[A];
-    let b = proof.advice_evals[B];
-    let c = proof.advice_evals[C];
-    let q_a     = proof.fixed_evals[Q_A];
-    let q_b     = proof.fixed_evals[Q_B];
-    let q_c     = proof.fixed_evals[Q_C];
-    let q_ab    = proof.fixed_evals[Q_AB];
-    let q_const = proof.fixed_evals[Q_CONST];
+pub fn evaluate_gates(
+    vk: &PlonkProtocol,
+    proof: &PlonkProof,
+    instance_evals: &[Fr],
+    user_challenges: &[Fr],
+) -> Result<Vec<Fr>, Error> {
+    let ctx = expression::EvalContext {
+        advice_evals:    &proof.advice_evals,
+        fixed_evals:     &proof.fixed_evals,
+        instance_evals,
+        user_challenges,
+    };
 
-    // q_a·a + q_b·b + q_c·c + q_ab·a·b + q_const = 0
-    let expr = q_a * a + q_b * b + q_c * c + q_ab * a * b + q_const;
-    Ok(alloc::vec![expr])
+    let mut out: Vec<Fr> = Vec::new();
+    for gate in &vk.gates {
+        for poly_bytecode in gate {
+            out.push(expression::evaluate(poly_bytecode, &ctx)?);
+        }
+    }
+    Ok(out)
 }
 
 /// Aggregate the vanishing argument's h-pieces into a single G1 commitment:
@@ -85,10 +69,12 @@ pub fn compute_expected_h_eval(
     proof: &PlonkProof,
     ch: &Challenges,
     lag: &lagrange::LagrangeEvaluations,
+    instance_evals: &[Fr],
+    user_challenges: &[Fr],
 ) -> Result<Fr, Error> {
     let mut expressions: Vec<Fr> = Vec::new();
-    expressions.extend(gate_standard_plonk(proof)?);
-    expressions.extend(permutation::expressions(vk, proof, ch, lag)?);
+    expressions.extend(evaluate_gates(vk, proof, instance_evals, user_challenges)?);
+    expressions.extend(permutation::expressions(vk, proof, ch, lag, instance_evals)?);
 
     #[cfg(feature = "debug-trace")] {
         for (i, e) in expressions.iter().enumerate() {
@@ -162,24 +148,37 @@ pub fn build_queries(
     // Halo2's order (single circuit, no instance queries, no lookups, no shuffles):
     //   advice (per-circuit) → permutation_product (at x, ωx, ω^last·x)
     //   → fixed → permutation_common → vanishing (h + random_poly).
-    // commit_id reflects the *slot* a commitment came from. Halo2 uses
-    // pointer-equality on CommitmentReference; we mirror it with stable
-    // integer ids so byte-equal commits in distinct slots stay separate.
+    // v1.5: query construction is driven by `vk.{advice,fixed}_queries`
+    // metadata (each entry is (column_index, rotation)). One column may
+    // appear in many queries at different rotations — Fibonacci queries
+    // its single advice column at three rotations. Same column → same
+    // commit_id (mirrors halo2's pointer-eq on `CommitmentReference`).
     let mut q: Vec<VerifierQuery> = Vec::new();
     let mut next_id: usize = 0;
     let mut id = || { let i = next_id; next_id += 1; i };
 
-    // Pre-allocate ids per slot list, in the order halo2 builds query references.
-    let advice_ids:    Vec<usize> = proof.advice_commits.iter().map(|_| id()).collect();
-    let perm_prod_ids: Vec<usize> = proof.permutation_product_commits.iter().map(|_| id()).collect();
-    let fixed_ids:     Vec<usize> = vk.fixed_commitments.iter().map(|_| id()).collect();
+    // ID per *column slot*, not per query. Multiple queries on the same
+    // advice column share a commit_id.
+    let advice_col_ids:  Vec<usize> = proof.advice_commits.iter().map(|_| id()).collect();
+    let perm_prod_ids:   Vec<usize> = proof.permutation_product_commits.iter().map(|_| id()).collect();
+    let fixed_col_ids:   Vec<usize> = vk.fixed_commitments.iter().map(|_| id()).collect();
     let perm_common_ids: Vec<usize> = vk.permutation_commitments.iter().map(|_| id()).collect();
     let h_id      = id();
     let random_id = id();
 
-    // (1) Advice — at x.
-    for ((cid, commit), eval) in advice_ids.iter().zip(proof.advice_commits.iter()).zip(proof.advice_evals.iter()) {
-        q.push(VerifierQuery { commit_id: *cid, commitment: *commit, point: ch.x, eval: *eval });
+    let n: u64 = 1u64 << vk.k;
+
+    // (1) Advice — one VerifierQuery per advice query.
+    for (q_idx, (col_index, rotation)) in vk.advice_queries.iter().enumerate() {
+        let col = *col_index as usize;
+        let commit = *proof.advice_commits.get(col)
+            .ok_or(Error::Protocol("build_queries: advice column index out of range"))?;
+        let point  = rotate_point(ch.x, omega, *rotation, n);
+        let eval   = *proof.advice_evals.get(q_idx)
+            .ok_or(Error::Protocol("build_queries: advice eval index out of range"))?;
+        q.push(VerifierQuery {
+            commit_id: advice_col_ids[col], commitment: commit, point, eval,
+        });
     }
     // (2) Permutation product — at x, ω·x, and (for non-last sets) ω^last·x.
     let last_idx = vk.num_perm_chunks.saturating_sub(1);
@@ -193,16 +192,22 @@ pub fn build_queries(
         q.push(VerifierQuery { commit_id: *cid, commitment: *commit, point: ch.x,   eval: z });
         q.push(VerifierQuery { commit_id: *cid, commitment: *commit, point: x_next, eval: z_omega });
     }
-    // Halo2 emits z_last queries in REVERSE-skip-first order (`sets.iter().rev().skip(1)`),
-    // i.e., for chunks indexed [last_idx-1, last_idx-2, ..., 0].
     for i in (0..last_idx).rev() {
         let (_z, _z_omega, z_last) = proof.permutation_product_evals[i];
         let commit = proof.permutation_product_commits[i];
         q.push(VerifierQuery { commit_id: perm_prod_ids[i], commitment: commit, point: x_last, eval: z_last });
     }
-    // (3) Fixed — at x.
-    for ((cid, commit), eval) in fixed_ids.iter().zip(vk.fixed_commitments.iter()).zip(proof.fixed_evals.iter()) {
-        q.push(VerifierQuery { commit_id: *cid, commitment: *commit, point: ch.x, eval: *eval });
+    // (3) Fixed — one VerifierQuery per fixed query.
+    for (q_idx, (col_index, rotation)) in vk.fixed_queries.iter().enumerate() {
+        let col = *col_index as usize;
+        let commit = *vk.fixed_commitments.get(col)
+            .ok_or(Error::Protocol("build_queries: fixed column index out of range"))?;
+        let point  = rotate_point(ch.x, omega, *rotation, n);
+        let eval   = *proof.fixed_evals.get(q_idx)
+            .ok_or(Error::Protocol("build_queries: fixed eval index out of range"))?;
+        q.push(VerifierQuery {
+            commit_id: fixed_col_ids[col], commitment: commit, point, eval,
+        });
     }
     // (4) Permutation common — at x.
     for ((cid, commit), eval) in perm_common_ids.iter().zip(vk.permutation_commitments.iter()).zip(proof.permutation_common_evals.iter()) {
@@ -213,6 +218,20 @@ pub fn build_queries(
     q.push(VerifierQuery { commit_id: random_id, commitment: proof.random_poly_commit, point: ch.x, eval: proof.random_poly_eval });
 
     Ok(q)
+}
+
+/// `x · ω^rotation`, with negative rotations resolved via cyclic identity
+/// `ω⁻¹ = ω^(n-1)` so we never need a field inversion.
+#[inline]
+fn rotate_point(x: Fr, omega: Fr, rotation: i32, n: u64) -> Fr {
+    let exp = if rotation >= 0 {
+        rotation as u64
+    } else {
+        // ω^(-r) = ω^(n - r mod n) for r > 0
+        let r = (-(rotation as i64)) as u64 % n;
+        n - r
+    };
+    x * pow_u64(omega, exp)
 }
 
 /// Top-level verify.
@@ -280,10 +299,38 @@ pub fn verify(
         eprintln!("[verifier] l_blind = {}", _fr_hex(&lag.l_blind));
     }
 
-    // 4. Build gate + permutation expressions, fold with y, divide by xn-1.
-    //    Lives in its own helper so its intermediate `Vec<Fr>`s don't pile up
-    //    on `verify`'s BPF stack frame.
-    let expected_h_eval = compute_expected_h_eval(&vk, &proof, &ch, &lag)?;
+    // 4. Reconstruct instance evals at challenge x via Lagrange basis (halo2's
+    //    `QUERY_INSTANCE = false` path). Public inputs are the per-column
+    //    Fr values; for circuits with no instance columns (StandardPlonk)
+    //    this is empty.
+    let public_inputs_per_column: alloc::vec::Vec<alloc::vec::Vec<Fr>> = if vk.num_instance == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        // Caller passes a flat `&[[u8; 32]]` of public inputs; we treat it
+        // as one column with one entry per scalar. (Multi-column instance
+        // circuits should be passed an explicitly-shaped layout in v2.)
+        let mut col0 = alloc::vec::Vec::with_capacity(public_inputs.len());
+        for raw in public_inputs {
+            col0.push(crate::field::fr_from_bytes_be(raw)?);
+        }
+        let mut cols = alloc::vec::Vec::with_capacity(vk.num_instance);
+        cols.push(col0);
+        for _ in 1..vk.num_instance {
+            cols.push(alloc::vec::Vec::new());
+        }
+        cols
+    };
+    let instance_evals = lagrange::reconstruct_instance_evals(
+        vk.k, vk.omega, ch.x, &vk.instance_queries, &public_inputs_per_column,
+    )?;
+
+    // user_challenges placeholder — circuits with `vk.num_challenges > 0`
+    // need a separate challenge-derivation pass; out of scope for v1.5.
+    let user_challenges: alloc::vec::Vec<Fr> = alloc::vec::Vec::new();
+
+    let expected_h_eval = compute_expected_h_eval(
+        &vk, &proof, &ch, &lag, &instance_evals, &user_challenges,
+    )?;
 
     // 5. Aggregate the h-pieces into one virtual commitment.
     let h_commitment = aggregate_h_commitment(&proof.vanishing_h_commits, lag.xn)?;
@@ -387,32 +434,10 @@ mod tests {
         }
     }
 
-    /// Gate identity holds trivially when all selectors and advice are zero.
-    #[test]
-    fn gate_zero_advice_zero_selectors_evaluates_to_zero() {
-        let p = synth_proof_for_gate([0; 3], [0; 5]);
-        let exprs = gate_standard_plonk(&p).unwrap();
-        assert_eq!(exprs, alloc::vec![Fr::ZERO]);
-    }
-
-    /// q_a·a + q_b·b + q_c·c + q_ab·a·b + q_const  =  3·5 + 7·11 + 0 + 0 + 100
-    /// = 15 + 77 + 100 = 192
-    #[test]
-    fn gate_value_matches_hand_computation() {
-        // advice = [a=5, b=11, c=99]   fixed = [q_a=3, q_b=7, q_c=0, q_ab=0, q_const=100]
-        let p = synth_proof_for_gate([5, 11, 99], [3, 7, 0, 0, 100]);
-        let exprs = gate_standard_plonk(&p).unwrap();
-        assert_eq!(exprs, alloc::vec![Fr::from(192u64)]);
-    }
-
-    /// Exercises the q_ab·a·b cross-term: 1·a·b = a·b.
-    #[test]
-    fn gate_quadratic_term() {
-        // q_a=q_b=q_c=q_const=0, q_ab=1 → expr = 1·a·b = 6·7 = 42
-        let p = synth_proof_for_gate([6, 7, 0], [0, 0, 0, 1, 0]);
-        let exprs = gate_standard_plonk(&p).unwrap();
-        assert_eq!(exprs, alloc::vec![Fr::from(42u64)]);
-    }
+    // The hard-coded `gate_standard_plonk` tests were removed in v1.5 —
+    // the same gate identity is now exercised by `expression::tests::
+    // standard_plonk_gate`, which runs the equivalent RPN bytecode through
+    // the generic evaluator.
 
     #[test]
     fn aggregate_h_single_piece_returns_input() {
@@ -441,10 +466,9 @@ mod tests {
         assert_eq!(r, G1::IDENTITY);
     }
 
-    /// Build queries — confirm count matches expected layout.
-    /// Standard v1 with 3 advice, 5 fixed, 3 perm cols, 1 perm chunk:
-    /// queries = 3 advice + 5 fixed + 3 perm_common + (2 for perm_product, no z_last for last chunk)
-    ///         + 1 h_commitment + 1 random_poly  =  15 queries
+    /// Build queries — confirm count matches expected layout (v1.5 driven by
+    /// `vk.{advice,fixed}_queries` metadata). 3 advice cols × 1 query each,
+    /// 5 fixed cols × 1 query each, 3 perm cols, 1 perm chunk.
     #[test]
     fn build_queries_count_matches_layout() {
         let vk = PlonkProtocol {
@@ -460,7 +484,9 @@ mod tests {
             num_perm_chunks: 1,
             fixed_commitments: alloc::vec![G1::IDENTITY; 5],
             permutation_commitments: alloc::vec![G1::IDENTITY; 3],
-            transcript_repr: [0u8; 32],
+            advice_queries: (0..3u32).map(|i| (i, 0i32)).collect(),
+            fixed_queries:  (0..5u32).map(|i| (i, 0i32)).collect(),
+            transcript_repr: [0u8; 32], ..Default::default()
         };
         let mut proof = synth_proof_for_gate([1; 3], [1; 5]);
         proof.fixed_evals = alloc::vec![Fr::ONE; 5];
