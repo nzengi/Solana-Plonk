@@ -272,9 +272,8 @@ fn run_traced(
     cu("[stage] after lagrange");
 
     let instance_evals = reconstruct_instance_evals_helper(&vk, ch.x, &public_inputs)?;
-    let user_challenges: alloc::vec::Vec<ark_bn254::Fr> = alloc::vec::Vec::new();
     let expected_h_eval = v::compute_expected_h_eval(
-        &vk, &proof, &ch, &lag, &instance_evals, &user_challenges,
+        &vk, &proof, &ch, &lag, &instance_evals, &ch.user_challenges,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after expected_h_eval");
     let _ = expected_h_eval;

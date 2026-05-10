@@ -1,11 +1,17 @@
 # Halo2 Verifier on Solana — CU Profile & SIMD Case
 
-> **v1.5 update (2026-05-10)** — the verifier is now circuit-shape agnostic
-> via a generic gate-AST evaluator. The hard-coded StandardPlonk gate is
-> gone; any halo2 circuit (without lookups/shuffles) can be verified by
-> the same `.so`. Two circuits are exercised in this profile:
-> StandardPlonk (regression baseline) and Fibonacci (rotation::next() +
-> instance column path).
+> **v2.0 update (2026-05-10)** — the verifier now supports halo2's
+> **lookup arguments** (Plookup-family) and **shuffle arguments**, and
+> single-phase user-defined challenges. Four circuits are exercised in
+> this profile: StandardPlonk, Fibonacci, range-check (lookup), shuffle.
+> Shadow comparator (differential test against halo2's reference verifier)
+> validates lookup soundness on real prover output. The on-chain VK
+> format has bumped `H2SV0002 → H2SV0003` (+8 bytes for empty
+> lookup/shuffle blocks; variable for non-empty).
+>
+> **v1.5 (historical)** — gate-AST evaluator made the verifier
+> circuit-shape agnostic without lookups/shuffles. v2.0 lifts those
+> remaining restrictions.
 
 
 **A working PSE-Halo2 BN254/KZG/SHPLONK verifier on Solana BPF, end-to-end measured, devnet-deployed, cap-bound.**
@@ -27,7 +33,9 @@ The numbers are not synthetic. They come from:
 | **2,710,424 CU** | v1 cost to verify a k=4 StandardPlonk proof on BPF (Mollusk). |
 | **2,728,844 CU** | v1.5 cost on the same StandardPlonk proof — **+0.7%** AST overhead. |
 | **2,284,029 CU** | v1.5 cost on a Fibonacci circuit (1 advice + 1 fixed selector + 1 instance). |
-| **1,399,644 CU** | What the on-chain devnet tx consumed before hitting the 1.4M ceiling. |
+| **1,692,408 CU** | v2.0 cost on a 4-bit range-check Plookup circuit (k=6, 16-entry table). |
+| **1,374,962 CU** | v2.0 cost on a 4-element shuffle circuit (k=5) — **fits under Solana's default 1.4M per-tx CU cap without raise**. |
+| **1,399,644 CU** | What the on-chain devnet tx consumed before hitting the 1.4M ceiling (StandardPlonk). |
 | **1,667,016 CU = 62%** | Cost of `shplonk::verify_opening` alone (StandardPlonk). |
 | **533,709 CU = 20%** | Cost of `lagrange::evaluate_lagrange` (5 Fr inverses). |
 | **49,546 CU = 2%** | Cost of the final `alt_bn128_pairing` syscall (already a syscall — optimal). |
@@ -176,6 +184,104 @@ arbitrary gate polynomials over the standard arithmetic ops.
 - Lookup arguments (Plookup-family). Rejected at compile time.
 - Shuffle arguments. Rejected at compile time.
 - User-defined phase challenges (`vk.cs.num_challenges > 0`).
+
+## 3b. v2.0 — lookup + shuffle + user challenges
+
+v2.0 lifts the three v1.5 restrictions. Four crates added/updated:
+
+- `crates/verifier/src/plonk/lookup.rs` — emits 5 expressions per lookup
+  (l_0/l_last/active-row/permuted_input/permuted_table identities) and
+  routes 5 SHPLONK queries per lookup into `build_queries`. Theta-fold
+  compression of input/table expression lists matches halo2's forward
+  Horner direction.
+- `crates/verifier/src/plonk/shuffle.rs` — 3 expressions + 2 SHPLONK
+  queries per shuffle. Uses γ only (no β); cheaper than lookup.
+- `crates/verifier/src/plonk/proof_reader.rs` — wire-side reads for the
+  v2.0 layout: per-lookup 2 G1 (after θ) + 1 G1 (after perm products),
+  per-shuffle 1 G1, plus 5 Fr per lookup + 2 Fr per shuffle in the
+  evaluation phase. User challenges squeezed after advice batch.
+- `crates/vk-host/src/compile.rs` — bumps magic to `H2SV0003`, encodes
+  lookup + shuffle expression bytecodes, hard-rejects multi-phase
+  circuits.
+
+### Per-stage CU breakdown (v2.0 circuits)
+
+Range-check (4-bit Plookup, k=6, 16-entry table, 8 input values):
+
+| Stage                       | CU       | %    |
+|-----------------------------|---------:|-----:|
+| entry                       | 558      | <1%  |
+| parse_vk                    | 11,089   | <1%  |
+| read_proof                  | 149,334  | 9%   |
+| lagrange::evaluate_lagrange | 542,854  | 32%  |
+| compute_expected_h_eval     | 95,975   | 6%   |
+| h_commit                    | 23,600   | 1%   |
+| omega_last                  | 19,248   | 1%   |
+| build_queries               | 35,771   | 2%   |
+| **shplonk::verify_opening** | **764,412** | **45%** |
+| pairing                     | 49,546   | 3%   |
+| **TOTAL**                   | **1,692,387** | 100% |
+
+Shuffle (4-element multiset eq, k=5):
+
+| Stage                       | CU       | %    |
+|-----------------------------|---------:|-----:|
+| entry                       | 558      | <1%  |
+| parse_vk                    | 10,910   | <1%  |
+| read_proof                  | 121,559  | 9%   |
+| lagrange::evaluate_lagrange | 542,361  | 39%  |
+| compute_expected_h_eval     | 80,968   | 6%   |
+| h_commit                    | 15,724   | 1%   |
+| omega_last                  | 15,415   | 1%   |
+| build_queries               | 9,809    | <1%  |
+| **shplonk::verify_opening** | **528,091** | **38%** |
+| pairing                     | 49,546   | 4%   |
+| **TOTAL**                   | **1,374,941** | 100% |
+
+### v2.0 vs v1.5
+
+| Metric                        | StandardPlonk | Fibonacci | Range-check | Shuffle |
+|-------------------------------|--------------:|----------:|------------:|--------:|
+| Verify total (Mollusk)        | 2,728,844     | 2,284,029 | 1,692,408   | 1,374,962 |
+| `shplonk` portion             | 61%           | 52%       | 45%         | 38%     |
+| `lagrange` portion            | 20%           | 23%       | 32%         | 39%     |
+| Fits in 1.4M tx ceiling?      | ❌            | ❌        | ❌          | **✅ yes (no raise)** |
+| Lookup support exercised?     | —             | —         | ✓ Plookup   | —       |
+| Shuffle support exercised?    | —             | —         | —           | ✓       |
+
+The shuffle circuit is the **first verifier path that fits under
+Solana's default 1,400,000 CU per-instruction cap without
+`set_compute_unit_limit`**. The reason: shuffle has only 1 G1 + 2 Fr
+per shuffle (versus lookup's 3 G1 + 5 Fr) and 2 SHPLONK queries (vs 5).
+For circuits whose constraint shape compresses well into shuffle
+arguments — e.g. multiset equality, simple permutations, sortedness
+checks — v2.0 ships a usable verifier with margin.
+
+### Soundness audit (shadow)
+
+`circuits/range-check/src/shadow.rs` and `circuits/shuffle-check/src/shadow.rs`
+implement a differential test: run halo2's reference `verify_proof` and
+our `halo2_solana_verifier::verify` on the same proof bytes; assert
+both accept the valid proof and both reject targeted byte mutations
+(advice commit, lookup/shuffle commit, lookup/shuffle eval). Asymmetric
+verdict (one accepts, the other rejects) is a soundness bug — the
+shadow panics. Six mutation points across the two circuits, all
+symmetric ✓.
+
+### v2.0 scope clarifications
+
+What v2.0 supports:
+- Any number of lookups + shuffles
+- Single-phase user-defined challenges (`cs.challenge_usable_after(FirstPhase)`)
+- Same backward-compat: zero lookups + zero shuffles + zero challenges
+  matches v1.5 byte-for-byte (just two extra `0u32` footers in VK)
+
+What v2.0 still does **not** support (deferred to v2.1+):
+- **Multi-phase** advice columns / challenges. vk-host hard-rejects.
+- **Field-arithmetic SIMD** (`alt_bn128_fr_arith`). Lagrange remains
+  ~30-39% of total CU, the next-largest leverage point after SHPLONK.
+- **2-tx split** for circuits that don't fit one tx. Range-check still
+  needs `set_compute_unit_limit(1_700_000)` or a 2-tx split for mainnet.
 
 ## 4a. Projected impact of `alt_bn128_g1_msm` (SIMD-XXXX)
 
@@ -344,9 +450,12 @@ This generates a fresh data account, chunks the golden vector into LOAD txs, the
 | ✅ v1: working Halo2 verifier (StandardPlonk-specialised gate) | Done |
 | ✅ Mollusk per-stage CU profile | Done |
 | ✅ Devnet deploy + verify-attempt tx | Done |
-| ⏳ `alt_bn128_g1_msm` SIMD draft + benchmarks | Open |
-| ⏳ v1.5: gate-AST evaluator (any halo2 circuit, not just StandardPlonk) | Open |
-| ⏳ `alt_bn128_fr_arith` SIMD draft | Open |
+| ✅ `alt_bn128_g1_msm` SIMD draft + benchmarks (SIMD discussion #535) | Done |
+| ✅ v1.5: gate-AST evaluator (any halo2 circuit, not just StandardPlonk) | Done |
+| ✅ v2.0: lookup + shuffle + single-phase challenges + shadow audit | Done |
+| ⏳ `alt_bn128_fr_arith` SIMD draft (Layer 3) | Open |
+| ⏳ 2-tx split for mainnet (Layer 1 fallback) | Open |
+| ⏳ Multi-phase support (v2.1) | Open |
 | ⏳ Application layer: cypherpunk app on top of the verifier | Open |
 
 ---
