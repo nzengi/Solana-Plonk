@@ -257,6 +257,31 @@ For circuits whose constraint shape compresses well into shuffle
 arguments — e.g. multiset equality, simple permutations, sortedness
 checks — v2.0 ships a usable verifier with margin.
 
+### Devnet evidence (v2.0)
+
+The shuffle circuit's verify-tx **landed successfully on devnet at the
+default 1.4M CU cap**:
+
+| Tx                                                                                         | Status | CU consumed |
+|--------------------------------------------------------------------------------------------|--------|------------:|
+| [`5DSF3xKZN6Mp…`](https://explorer.solana.com/tx/5DSF3xKZN6MpKkjLNm9rKm4jeU6a5ywv6d1NjjusRVbBuhMvsk7JA7rxp5j15HK3KCWzcZYBoKN2V7DKSdSJndpZ?cluster=devnet) (shuffle) | **Success** ✓ | 1,372,980 / 1,399,700 |
+| [`2gMQXTfCfdAn…`](https://explorer.solana.com/tx/2gMQXTfCfdAnyRnqVz7zzoTaWzzNi5XdktZi9vjWe9sT9GcHTN2tXBYt8E1QHvdrbqrDKTQBwiRVgMJ7TYxoBDWo?cluster=devnet) (range-check) | Failed (`exceeded CUs meter`) | 1,399,644 / 1,399,700 |
+| [`3r1ZSg3DX6Jh…`](https://explorer.solana.com/tx/3r1ZSg3DX6JhWp3zupEqqUptyz8GGpFekoqkjfyepBZySDCScMo5DAZYtwHpAM6cFw2Zajfchw7K7hho6YGXUje5?cluster=devnet) (StandardPlonk, v1 historical) | Failed | 1,399,644 / 1,399,700 |
+
+The Mollusk-vs-on-chain delta for shuffle: **1,374,962 (Mollusk) →
+1,372,980 (on-chain) = 0.15% match**, confirming the Mollusk CU model
+is faithful to runtime. The shuffle tx is the **first Halo2 verifier
+path to land successfully on Solana** without needing
+`set_compute_unit_limit` raises or 2-tx splits.
+
+Range-check still aborts at the 1.4M ceiling — confirms lookup
+circuits remain blocked on the SIMD case until Layer 2
+(`alt_bn128_g1_msm`) ships.
+
+Replay any of these via `solana confirm -v <SIG> -u devnet`. Replay
+the shuffle round-trip locally with
+`cargo run -p devnet-send -- --sh`.
+
 ### Soundness audit (shadow)
 
 `circuits/range-check/src/shadow.rs` and `circuits/shuffle-check/src/shadow.rs`

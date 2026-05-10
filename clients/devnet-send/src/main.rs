@@ -56,13 +56,13 @@ const KEYPAIR_PATH: &str = "/home/nzengi/.config/solana/id.json";
 const VERIFY_TAG: u8 = 0x00;
 const LOAD_TAG:   u8 = 0x01;
 
-/// Translate the Fibonacci circuit's `GLDN0002` blob (which is what
-/// `gen-fib-proof --write-golden` emits) into the verifier-program's
-/// `GLDN0001` instruction-data layout. The byte content is the same
-/// downstream of the magic — we only swap the 8-byte prefix.
-fn repackage_fib_golden_to_gldn0001(raw: &[u8]) -> Result<Vec<u8>> {
+/// Translate a `GLDN0002` blob (Fibonacci / range-check / shuffle goldens)
+/// into the verifier-program's `GLDN0001` instruction-data layout. The
+/// byte content is identical downstream of the magic — only the 8-byte
+/// prefix changes.
+fn repackage_gldn0002_to_gldn0001(raw: &[u8]) -> Result<Vec<u8>> {
     if raw.len() < 8 || &raw[..8] != b"GLDN0002" {
-        anyhow::bail!("expected GLDN0002 magic in Fibonacci golden file");
+        anyhow::bail!("expected GLDN0002 magic in golden file");
     }
     let mut out = Vec::with_capacity(raw.len());
     out.extend_from_slice(b"GLDN0001");
@@ -70,35 +70,50 @@ fn repackage_fib_golden_to_gldn0001(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    StandardPlonk,
+    Fibonacci,
+    RangeCheck,
+    Shuffle,
+}
+
 fn main() -> Result<()> {
     let program_id: Pubkey = PROGRAM_ID_STR.parse()?;
 
-    // Mode selection: default = StandardPlonk; `--fib` switches to Fibonacci.
-    let fib_mode = std::env::args().any(|a| a == "--fib");
-
-    // Load golden vector.
-    let mut golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if fib_mode {
-        golden.push("../../circuits/fibonacci/tests/golden_v15_fib.bin");
+    // Mode selection: `--fib` / `--rc` / `--sh`; default = StandardPlonk.
+    let mode = if std::env::args().any(|a| a == "--fib") {
+        Mode::Fibonacci
+    } else if std::env::args().any(|a| a == "--rc") {
+        Mode::RangeCheck
+    } else if std::env::args().any(|a| a == "--sh") {
+        Mode::Shuffle
     } else {
-        golden.push("../../circuits/standard-plonk/tests/golden_v1.bin");
-    }
+        Mode::StandardPlonk
+    };
+
+    // Load golden vector + label per mode.
+    let (rel_path, mode_label, needs_repackage) = match mode {
+        Mode::StandardPlonk => ("../../circuits/standard-plonk/tests/golden_v1.bin",
+                                "StandardPlonk, GLDN0001", false),
+        Mode::Fibonacci     => ("../../circuits/fibonacci/tests/golden_v15_fib.bin",
+                                "Fibonacci, GLDN0002 → repackaged", true),
+        Mode::RangeCheck    => ("../../circuits/range-check/tests/golden_v2_rc.bin",
+                                "Range-check (Plookup), GLDN0002 → repackaged", true),
+        Mode::Shuffle       => ("../../circuits/shuffle-check/tests/golden_v2_sh.bin",
+                                "Shuffle, GLDN0002 → repackaged", true),
+    };
+    let mut golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    golden.push(rel_path);
     let raw = std::fs::read(&golden)?;
 
-    // The Fibonacci golden file uses magic `GLDN0002` and carries a
-    // `[n_pi: u32 LE | pi: 32B × n_pi]` suffix after the kzg fields.
-    // The verifier-program's `parse_instruction` accepts the same suffix
-    // shape under magic `GLDN0001`, so we transcode if needed.
-    let payload = if fib_mode {
-        repackage_fib_golden_to_gldn0001(&raw)?
+    let payload = if needs_repackage {
+        repackage_gldn0002_to_gldn0001(&raw)?
     } else {
         raw
     };
     let payload_len = payload.len();
-    eprintln!(
-        "[1/?] loaded golden vector ({}): {payload_len} B from {golden:?}",
-        if fib_mode { "Fibonacci, GLDN0002" } else { "StandardPlonk, GLDN0001" },
-    );
+    eprintln!("[1/?] loaded golden vector ({mode_label}): {payload_len} B from {golden:?}");
 
     let client = RpcClient::new_with_commitment(DEVNET_URL, CommitmentConfig::confirmed());
     let payer = read_keypair_file(KEYPAIR_PATH)
