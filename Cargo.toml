@@ -10,6 +10,7 @@ members = [
     "circuits/range-check",
     "circuits/shuffle-check",
     "circuits/challenge-check",
+    "circuits/multi-lookup-check",
     "programs/verifier-program",
     "programs/g1-msm-bench",
     "clients/devnet-send",

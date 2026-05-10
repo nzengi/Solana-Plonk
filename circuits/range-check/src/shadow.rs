@@ -91,38 +91,36 @@ pub fn audit(
         ));
     }
 
-    // ── (2) targeted mutations. We pick offsets that land inside three
-    //   distinct proof-section types so each is exercised end-to-end:
-    //     a) advice commit byte   (G1 byte)
-    //     b) lookup permuted_input commit byte
-    //     c) lookup product_eval byte (Fr byte)
-    //   Exact byte offsets depend on the proof layout but are stable for
-    //   a fixed VK. We compute them from the v2.0 wire layout knowledge.
-    let layout = layout_offsets(&v.halo2_vk);
-    eprintln!(
-        "[shadow]   layout: advice@{}  lookup_pi_commit@{}  lookup_product_eval@{}",
-        layout.advice_commit_byte,
-        layout.lookup_permuted_input_commit_byte,
-        layout.lookup_product_eval_byte,
-    );
+    // ── (2) extended mutation set. 10 distinct proof regions, each
+    // bit-flipped independently. Both verifiers must reject every one
+    // symmetrically — asymmetric verdict ⇒ soundness bug.
+    let layout = layout_offsets(&v.halo2_vk, v.proof_bytes.len());
 
-    for (label, off) in [
+    let mutations: &[(&str, usize)] = &[
         ("advice_commit",                 layout.advice_commit_byte),
         ("lookup_permuted_input_commit",  layout.lookup_permuted_input_commit_byte),
+        ("lookup_permuted_table_commit",  layout.lookup_permuted_table_commit_byte),
+        ("lookup_product_commit",         layout.lookup_product_commit_byte),
+        ("random_poly_commit",            layout.random_poly_commit_byte),
+        ("h_piece_commit",                layout.h_pieces_byte),
+        ("advice_eval",                   layout.advice_eval_byte),
+        ("random_poly_eval",              layout.random_poly_eval_byte),
         ("lookup_product_eval",           layout.lookup_product_eval_byte),
-    ] {
+        ("lookup_permuted_table_eval",    layout.lookup_permuted_table_eval_byte),
+        ("opening_proof_w",               layout.opening_proof_w_byte),
+    ];
+
+    for (label, off) in mutations {
         let mut mutated = v.proof_bytes.clone();
-        if off >= mutated.len() {
+        if *off >= mutated.len() {
             return Err(anyhow::anyhow!(
                 "shadow offset {off} out of range for proof of len {}", mutated.len(),
             ));
         }
-        mutated[off] ^= 0x01; // single-bit flip
-
+        mutated[*off] ^= 0x01;
         let h = run_halo2(params, &v.halo2_vk, &mutated);
         let o = run_ours(&v.vk_bytes, &mutated, &v.kzg_vk);
-        eprintln!("[shadow]   mutate {label:35} halo2={h:?} ours={o:?}");
-
+        eprintln!("[shadow]   mutate {label:32} (off {off:4}) halo2={h:?} ours={o:?}");
         if h != o {
             return Err(anyhow::anyhow!(
                 "soundness asymmetry on {label}: halo2={h:?} ours={o:?}",
@@ -135,20 +133,29 @@ pub fn audit(
         }
     }
 
-    eprintln!("[shadow] ✓ all mutations rejected by both verifiers");
+    eprintln!("[shadow] ✓ all 11 lookup mutations rejected symmetrically by both verifiers");
     Ok(())
 }
 
-/// Byte offsets into the proof for each kind of value we mutate.
+/// Byte offsets into the proof for each region we mutate.
+#[allow(dead_code)]
 struct ProofLayout {
     advice_commit_byte:                  usize,
     lookup_permuted_input_commit_byte:   usize,
+    lookup_permuted_table_commit_byte:   usize,
+    lookup_product_commit_byte:          usize,
+    random_poly_commit_byte:             usize,
+    h_pieces_byte:                       usize,
+    advice_eval_byte:                    usize,
+    random_poly_eval_byte:               usize,
     lookup_product_eval_byte:            usize,
+    lookup_permuted_table_eval_byte:     usize,
+    opening_proof_w_byte:                usize,
 }
 
 /// Compute the byte offsets we mutate. Mirrors the read order in
 /// `halo2_solana_verifier::proof_reader::read_proof` for the v2.0 layout.
-fn layout_offsets(vk: &VerifyingKey<G1Affine>) -> ProofLayout {
+fn layout_offsets(vk: &VerifyingKey<G1Affine>, proof_len: usize) -> ProofLayout {
     const G1_LEN: usize = 64;
     const FR_LEN: usize = 32;
 
@@ -162,45 +169,53 @@ fn layout_offsets(vk: &VerifyingKey<G1Affine>) -> ProofLayout {
     let num_advice_q  = cs.advice_queries().len();
     let num_fixed_q   = cs.fixed_queries().len();
 
-    // Wire layout (lookup-only circuit, no shuffles, no instance):
-    //   advice_commits           : num_advice                G1
-    //   lookup permuted_*_commits: 2 · num_lookups            G1
-    //   perm_product commits     : num_perm_chunks            G1
-    //   lookup product_commits   : num_lookups                G1
-    //   random_poly commit       : 1                          G1
-    //   vanishing h pieces       : cs_degree − 1              G1
-    //   advice_evals             : num_advice_q               Fr
-    //   fixed_evals              : num_fixed_q                Fr
-    //   random_poly_eval         : 1                          Fr
-    //   perm_common_evals        : num_perm_cols              Fr
-    //   perm_product_evals       : 3·(chunks-1) + 2           Fr
-    //   lookup_evals             : 5 · num_lookups            Fr
-    //   shuffle_evals            : 0                          Fr
-    //   opening_proof_w          : 1                          G1
-    //   opening_proof_w_prime    : 1                          G1
-    let advice_commit_byte = 0; // very first byte of advice_commits[0]
+    // G1 region — sequential reads in proof_reader.rs::read_proof:
+    let advice_commit_byte = 0;
     let lookup_permuted_input_commit_byte = num_advice * G1_LEN;
-    let g1_count_before_lookup_evals =
+    let lookup_permuted_table_commit_byte = lookup_permuted_input_commit_byte + G1_LEN;
+    let off_perm_product_commits =
+        lookup_permuted_input_commit_byte + 2 * num_lookups * G1_LEN;
+    let lookup_product_commit_byte = off_perm_product_commits + num_perm_chunks * G1_LEN;
+    let random_poly_commit_byte = lookup_product_commit_byte + num_lookups * G1_LEN;
+    let h_pieces_byte = random_poly_commit_byte + G1_LEN;
+
+    // Fr region begins after all G1 commits + h pieces.
+    let g1_count_through_h =
         num_advice
         + 2 * num_lookups
         + num_perm_chunks
         + num_lookups
         + 1
         + cs_degree.saturating_sub(1);
+    let fr_region_start = g1_count_through_h * G1_LEN;
+
+    let advice_eval_byte = fr_region_start;
+    let off_random_poly_eval =
+        fr_region_start + (num_advice_q + num_fixed_q) * FR_LEN;
+    let random_poly_eval_byte = off_random_poly_eval;
+
     let perm_prod_evals_count = if num_perm_chunks == 0 { 0 } else { 3 * (num_perm_chunks - 1) + 2 };
-    let fr_count_before_lookup_evals =
-        num_advice_q
-        + num_fixed_q
-        + 1
-        + num_perm_cols
-        + perm_prod_evals_count;
     let lookup_product_eval_byte =
-        g1_count_before_lookup_evals * G1_LEN
-      + fr_count_before_lookup_evals * FR_LEN;
+        off_random_poly_eval
+        + (1 + num_perm_cols + perm_prod_evals_count) * FR_LEN;
+    // 5 evals per lookup in order:
+    //   product_eval, product_next_eval, permuted_input_eval,
+    //   permuted_input_inv_eval, permuted_table_eval
+    let lookup_permuted_table_eval_byte = lookup_product_eval_byte + 4 * FR_LEN;
+
+    let opening_proof_w_byte = proof_len - 2 * G1_LEN;
 
     ProofLayout {
         advice_commit_byte,
         lookup_permuted_input_commit_byte,
+        lookup_permuted_table_commit_byte,
+        lookup_product_commit_byte,
+        random_poly_commit_byte,
+        h_pieces_byte,
+        advice_eval_byte,
+        random_poly_eval_byte,
         lookup_product_eval_byte,
+        lookup_permuted_table_eval_byte,
+        opening_proof_w_byte,
     }
 }

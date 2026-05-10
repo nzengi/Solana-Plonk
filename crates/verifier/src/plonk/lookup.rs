@@ -328,4 +328,117 @@ mod tests {
                          Fr::from(5u64), &ctx).unwrap();
         assert_eq!(r, Fr::from(13u64));
     }
+
+    /// Multi-lookup regression: 2 lookups in one circuit must produce
+    /// 5 × 2 = 10 expressions in declaration order. Catches off-by-one
+    /// in the lookup-iteration loop and confirms `proof.lookup_evals[i]`
+    /// is indexed correctly per-lookup.
+    #[test]
+    fn two_lookups_emit_ten_expressions_in_order() {
+        // Two lookups:
+        //   lookup_0: input = advice[0], table = fixed[0]
+        //   lookup_1: input = advice[1], table = fixed[1]
+        let vk = PlonkProtocol {
+            cs_degree: 4,
+            num_advice_queries: 2,
+            num_fixed_queries: 2,
+            lookups: alloc::vec![
+                LookupArgument {
+                    input_expressions: alloc::vec![advice_bc(0)],
+                    table_expressions: alloc::vec![fixed_bc(0)],
+                },
+                LookupArgument {
+                    input_expressions: alloc::vec![advice_bc(1)],
+                    table_expressions: alloc::vec![fixed_bc(1)],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Distinct evals per lookup so we can detect cross-contamination.
+        // For lookup_0 we set a' = s' = 13 so expr_4 = l_0·(a'-s') = 0;
+        // expr_4's value distinguishes whether the loop indexed lookup_0
+        // correctly (NOT picking up lookup_1's a'/s' = 23/29).
+        let evals_0 = LookupEvals {
+            product_eval:            Fr::ONE,
+            product_next_eval:       Fr::ONE,
+            permuted_input_eval:     Fr::from(13u64),
+            permuted_input_inv_eval: Fr::from(13u64),
+            permuted_table_eval:     Fr::from(13u64),
+        };
+        let evals_1 = LookupEvals {
+            product_eval:            Fr::from(2u64),
+            product_next_eval:       Fr::from(2u64),
+            permuted_input_eval:     Fr::from(23u64),
+            permuted_input_inv_eval: Fr::from(23u64),
+            permuted_table_eval:     Fr::from(29u64),
+        };
+
+        let proof = PlonkProof {
+            advice_commits:                Vec::new(),
+            permutation_product_commits:   Vec::new(),
+            random_poly_commit:            crate::curve::G1::IDENTITY,
+            vanishing_h_commits:           Vec::new(),
+            advice_evals:                  alloc::vec![Fr::from(13u64), Fr::from(23u64)],
+            fixed_evals:                   alloc::vec![Fr::from(17u64), Fr::from(29u64)],
+            random_poly_eval:              Fr::ZERO,
+            permutation_common_evals:      Vec::new(),
+            permutation_product_evals:     Vec::new(),
+            lookup_permuted_input_commits: alloc::vec![
+                crate::curve::G1::IDENTITY, crate::curve::G1::IDENTITY,
+            ],
+            lookup_permuted_table_commits: alloc::vec![
+                crate::curve::G1::IDENTITY, crate::curve::G1::IDENTITY,
+            ],
+            lookup_product_commits:        alloc::vec![
+                crate::curve::G1::IDENTITY, crate::curve::G1::IDENTITY,
+            ],
+            lookup_evals:                  alloc::vec![evals_0, evals_1],
+            shuffle_product_commits:       Vec::new(),
+            shuffle_evals:                 Vec::new(),
+            opening_proof_w:               crate::curve::G1::IDENTITY,
+            opening_proof_w_prime:         crate::curve::G1::IDENTITY,
+        };
+
+        let exprs = expressions(&vk, &proof, &synth_ch(), &synth_lag(), &[], &[]).unwrap();
+        assert_eq!(exprs.len(), 10, "5 expressions × 2 lookups");
+
+        // exprs[0..5] correspond to lookup_0; exprs[5..10] to lookup_1.
+        // Lookup_0: a' = s' = 13, so expr_4 = l_0 · (a'-s') = 0.
+        assert_eq!(exprs[3], Fr::ZERO, "lookup_0 expr_4 should be 0 (a'=s')");
+        // Lookup_1: a' = 23, s' = 29 → expr_4 = l_0 · (23-29) = 2 · (-6) = -12.
+        assert_eq!(
+            exprs[3 + 5],
+            Fr::from(2u64) * (Fr::from(23u64) - Fr::from(29u64)),
+            "lookup_1 expr_4 should reflect a'-s' for lookup_1's evals, NOT lookup_0's",
+        );
+    }
+
+    /// Mismatched proof.lookup_evals length vs vk.num_lookups must error
+    /// (don't silently accept a malformed proof with too few/many evals).
+    #[test]
+    fn lookup_evals_length_mismatch_rejects() {
+        let vk = PlonkProtocol {
+            cs_degree: 4,
+            lookups: alloc::vec![
+                LookupArgument {
+                    input_expressions: alloc::vec![advice_bc(0)],
+                    table_expressions: alloc::vec![fixed_bc(0)],
+                },
+                LookupArgument {
+                    input_expressions: alloc::vec![advice_bc(0)],
+                    table_expressions: alloc::vec![fixed_bc(0)],
+                },
+            ],
+            ..Default::default()
+        };
+        // proof has only 1 lookup_evals, but vk says 2.
+        let proof = synth_proof(LookupEvals {
+            product_eval: Fr::ONE, product_next_eval: Fr::ONE,
+            permuted_input_eval: Fr::ZERO, permuted_input_inv_eval: Fr::ZERO,
+            permuted_table_eval: Fr::ZERO,
+        });
+        let r = expressions(&vk, &proof, &synth_ch(), &synth_lag(), &[], &[]);
+        assert!(matches!(r, Err(crate::Error::Protocol(_))));
+    }
 }

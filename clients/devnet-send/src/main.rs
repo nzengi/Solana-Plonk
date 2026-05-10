@@ -70,6 +70,18 @@ fn repackage_gldn0002_to_gldn0001(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Parse `--<name> <value>` from CLI args. Returns the parsed value if
+/// present, or `None` if the flag is absent.
+fn parse_named_arg(name: &str) -> Option<usize> {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, a) in args.iter().enumerate() {
+        if a == name {
+            return args.get(i + 1).and_then(|v| v.parse().ok());
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     StandardPlonk,
@@ -107,11 +119,42 @@ fn main() -> Result<()> {
     golden.push(rel_path);
     let raw = std::fs::read(&golden)?;
 
-    let payload = if needs_repackage {
+    let mut payload = if needs_repackage {
         repackage_gldn0002_to_gldn0001(&raw)?
     } else {
         raw
     };
+
+    // Optional 1-byte mutation: `--mutate-byte <off>` flips bit 0 at byte
+    // offset `off` of the proof region (i.e., the bytes inside payload that
+    // the verifier reads as proof_bytes — NOT the GLDN magic / vk_len /
+    // vk_bytes prefix). The offset is computed inside the proof region.
+    let mutate_off = parse_named_arg("--mutate-byte");
+    if let Some(off) = mutate_off {
+        // Compute the proof_bytes start offset inside `payload`.
+        // Layout: 8 magic + 4 vk_len + vk_bytes + 4 proof_len + proof_bytes
+        let vk_len = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+        let proof_start = 8 + 4 + vk_len + 4;
+        let proof_len = u32::from_le_bytes([
+            payload[8 + 4 + vk_len],
+            payload[8 + 4 + vk_len + 1],
+            payload[8 + 4 + vk_len + 2],
+            payload[8 + 4 + vk_len + 3],
+        ]) as usize;
+        if off >= proof_len {
+            anyhow::bail!(
+                "--mutate-byte {off} out of range: proof region is {proof_len} B",
+            );
+        }
+        let abs = proof_start + off;
+        let before = payload[abs];
+        payload[abs] ^= 0x01;
+        eprintln!(
+            "[!] MUTATED proof byte {off} (abs {abs}): {:#04x} → {:#04x}",
+            before, payload[abs],
+        );
+    }
+
     let payload_len = payload.len();
     eprintln!("[1/?] loaded golden vector ({mode_label}): {payload_len} B from {golden:?}");
 
@@ -213,10 +256,12 @@ fn main() -> Result<()> {
             }
             eprintln!("    https://explorer.solana.com/tx/{sig}?cluster=devnet");
             eprintln!();
-            eprintln!("This tx will show as `Failed` in the explorer with the");
-            eprintln!("`exceeded CUs meter` log — concrete evidence that Halo2");
-            eprintln!("verify hits Solana's per-tx CU ceiling. Primary case for");
-            eprintln!("the alt_bn128_g1_msm SIMD proposal.");
+            eprintln!("Inspect the tx via `solana confirm -v {sig} -u devnet`.");
+            eprintln!("Possible outcomes per circuit:");
+            eprintln!("  * Shuffle (1.37M CU, valid)        → Status: Ok");
+            eprintln!("  * Shuffle + tampered Fr eval        → Custom 0x200 (VERIFIER_REJECTED)");
+            eprintln!("  * Shuffle + tampered G1 commit      → Custom 0x201 (VERIFIER_ERROR, curve check)");
+            eprintln!("  * StandardPlonk / Fibonacci / Range-check → exceeded CUs meter (>1.4M total)");
         }
         Err(e) => {
             eprintln!("    submit FAILED: {e:#}");

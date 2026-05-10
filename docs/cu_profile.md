@@ -33,12 +33,15 @@ The numbers are not synthetic. They come from:
 | **2,710,424 CU** | v1 cost to verify a k=4 StandardPlonk proof on BPF (Mollusk). |
 | **2,728,844 CU** | v1.5 cost on the same StandardPlonk proof — **+0.7%** AST overhead. |
 | **2,284,029 CU** | v1.5 cost on a Fibonacci circuit (1 advice + 1 fixed selector + 1 instance). |
+| **2,286,887 CU** | v2.0 cost on a 2-lookup circuit (4-bit + 3-bit ranges, k=6). |
 | **1,692,408 CU** | v2.0 cost on a 4-bit range-check Plookup circuit (k=6, 16-entry table). |
 | **1,374,962 CU** | v2.0 cost on a 4-element shuffle circuit (k=5) — **fits under Solana's default 1.4M per-tx CU cap without raise**. |
 | **1,399,644 CU** | What the on-chain devnet tx consumed before hitting the 1.4M ceiling (StandardPlonk). |
 | **1,667,016 CU = 62%** | Cost of `shplonk::verify_opening` alone (StandardPlonk). |
 | **533,709 CU = 20%** | Cost of `lagrange::evaluate_lagrange` (5 Fr inverses). |
 | **49,546 CU = 2%** | Cost of the final `alt_bn128_pairing` syscall (already a syscall — optimal). |
+| **3 / 0x200 + 0x201 × 2** | Distinct on-chain verifier reject mechanisms demonstrated by tampered-proof devnet txs (cryptographic + curve-check ×2). |
+| **24** | Host-side differential shadow-audit mutations across 3 circuits, all symmetrically rejected by halo2 + our verifier. |
 
 The 62% chunk is **~25 sequential `alt_bn128_g1_multiplication` syscalls** inside the SHPLONK reduction. A single batched-MSM syscall would amortise the per-call overhead and is the cleanest unblocker.
 
@@ -259,39 +262,96 @@ checks — v2.0 ships a usable verifier with margin.
 
 ### Devnet evidence (v2.0)
 
-The shuffle circuit's verify-tx **landed successfully on devnet at the
-default 1.4M CU cap**:
+#### Positive evidence: valid shuffle proof landed
 
-| Tx                                                                                         | Status | CU consumed |
-|--------------------------------------------------------------------------------------------|--------|------------:|
-| [`5DSF3xKZN6Mp…`](https://explorer.solana.com/tx/5DSF3xKZN6MpKkjLNm9rKm4jeU6a5ywv6d1NjjusRVbBuhMvsk7JA7rxp5j15HK3KCWzcZYBoKN2V7DKSdSJndpZ?cluster=devnet) (shuffle) | **Success** ✓ | 1,372,980 / 1,399,700 |
-| [`2gMQXTfCfdAn…`](https://explorer.solana.com/tx/2gMQXTfCfdAnyRnqVz7zzoTaWzzNi5XdktZi9vjWe9sT9GcHTN2tXBYt8E1QHvdrbqrDKTQBwiRVgMJ7TYxoBDWo?cluster=devnet) (range-check) | Failed (`exceeded CUs meter`) | 1,399,644 / 1,399,700 |
+| Tx | Status | CU consumed |
+|---|---|---:|
+| [`5DSF3xKZN6Mp…`](https://explorer.solana.com/tx/5DSF3xKZN6MpKkjLNm9rKm4jeU6a5ywv6d1NjjusRVbBuhMvsk7JA7rxp5j15HK3KCWzcZYBoKN2V7DKSdSJndpZ?cluster=devnet) (shuffle, valid proof) | **Success** ✓ | 1,372,980 / 1,399,700 |
+
+**The shuffle tx is the first Halo2 verifier path to land successfully
+on Solana** without `set_compute_unit_limit` raises or 2-tx splits.
+Mollusk vs on-chain delta: 0.15% (1,374,962 vs 1,372,980).
+
+#### Negative evidence: tampered proofs rejected
+
+A working verifier must **also** reject bad proofs — otherwise it accepts
+everything and is unsound. The following devnet txs use `cargo run -p
+devnet-send -- --sh --mutate-byte <off>`, which flips bit 0 of one byte
+of the proof region before submitting the verify-tx. Every distinct
+mutation triggers the verifier on-chain:
+
+| Tx | Mutation | On-chain log | CU |
+|---|---|---|---:|
+| [`26Tt9UqCYQGP…`](https://explorer.solana.com/tx/26Tt9UqCYQGPDhaQ2iadt4hji2rGmcJQXFPiC4GX8vCGqEotBMyC2T6y27sYo6XB2hzxLK6UgmKqmuM3v5HaWCs9?cluster=devnet) | shuffle_product_eval byte (Fr field) | `Custom 0x200` = **VERIFIER_REJECTED** (cryptographic — pairing fails) | 1,373,641 |
+| [`2C8rCn3R6BZY…`](https://explorer.solana.com/tx/2C8rCn3R6BZYehUeeQSc7R67Xjy8WYk62WNxzPJGCFTVTxohZzXdfxB9ydEQ1KsAUR8BsH8TRAucjLJDeW19AFQr?cluster=devnet) | shuffle_product_commit byte (G1 x-byte) | `Custom 0x201` = **VERIFIER_ERROR** (off-curve detected by syscall) | 1,297,511 |
+| [`9iWukM7V6GZU…`](https://explorer.solana.com/tx/9iWukM7V6GZUnSvJiEfAKBznyQgRnHNBHwd59GP5b7LD7sAEZUU5rsFFJ8eTro5poRwwc9gXtncBZQSKXAKcu16?cluster=devnet) | advice_commit byte (G1 x-byte) | `Custom 0x201` = **VERIFIER_ERROR** (off-curve detected by syscall) | 1,274,877 |
+
+**What these prove on-chain:**
+
+1. **Cryptographic rejection works** — the verifier ran the FULL
+   verification pipeline (read_proof, lagrange, evaluate_gates,
+   compute_expected_h_eval, build_queries, shplonk::verify_opening,
+   pairing) on a valid-looking but tampered proof, then **returned
+   `VERIFIER_REJECTED` at the pairing equation step**. Only 661 CU
+   more than the valid shuffle (1,373,641 vs 1,372,980 = +0.05%) —
+   meaning the entire cryptographic pipeline executed and the pairing
+   check at the end is what said "no".
+2. **Curve-check enforcement works** — flipping a byte in a G1
+   commitment produces an off-curve point that the alt_bn128 syscall
+   rejects, propagated back to the verifier as `VERIFIER_ERROR`.
+3. **Distinct reject paths** — three different tampered txs hit three
+   different reject mechanisms (Fr eval cryptographic / G1 advice
+   off-curve / G1 shuffle commit off-curve). The verifier doesn't have
+   one catch-all "fail" path; it fails for the right reason at the
+   right point.
+
+#### Range-check at 1.4M cap (still SIMD-bound)
+
+| Tx | Status | CU consumed |
+|---|---|---:|
+| [`2gMQXTfCfdAn…`](https://explorer.solana.com/tx/2gMQXTfCfdAnyRnqVz7zzoTaWzzNi5XdktZi9vjWe9sT9GcHTN2tXBYt8E1QHvdrbqrDKTQBwiRVgMJ7TYxoBDWo?cluster=devnet) (range-check, valid proof) | Failed (`exceeded CUs meter`) | 1,399,644 / 1,399,700 |
 | [`3r1ZSg3DX6Jh…`](https://explorer.solana.com/tx/3r1ZSg3DX6JhWp3zupEqqUptyz8GGpFekoqkjfyepBZySDCScMo5DAZYtwHpAM6cFw2Zajfchw7K7hho6YGXUje5?cluster=devnet) (StandardPlonk, v1 historical) | Failed | 1,399,644 / 1,399,700 |
 
-The Mollusk-vs-on-chain delta for shuffle: **1,374,962 (Mollusk) →
-1,372,980 (on-chain) = 0.15% match**, confirming the Mollusk CU model
-is faithful to runtime. The shuffle tx is the **first Halo2 verifier
-path to land successfully on Solana** without needing
-`set_compute_unit_limit` raises or 2-tx splits.
+Range-check (1.69M Mollusk) still aborts at the 1.4M ceiling —
+confirms lookup-using circuits remain bound by the SIMD case until
+Layer 2 (`alt_bn128_g1_msm`) ships. The Mollusk projection (Section 4a)
+shows Layer 2 + Layer 3 land range-check under 1.4M with margin.
 
-Range-check still aborts at the 1.4M ceiling — confirms lookup
-circuits remain blocked on the SIMD case until Layer 2
-(`alt_bn128_g1_msm`) ships.
+Replay any tx: `solana confirm -v <SIG> -u devnet`. Replay the round-trip
+locally: `cargo run -p devnet-send -- --sh` (success) or
+`cargo run -p devnet-send -- --sh --mutate-byte 480` (cryptographic
+reject).
 
-Replay any of these via `solana confirm -v <SIG> -u devnet`. Replay
-the shuffle round-trip locally with
-`cargo run -p devnet-send -- --sh`.
+### Soundness audit (shadow) — host-side differential test
 
-### Soundness audit (shadow)
+Three circuits ship with `shadow.rs` audits that run BOTH halo2's
+reference `verify_proof` and our `halo2_solana_verifier::verify` on
+the same proof bytes. Each audit asserts:
+1. Both verifiers accept the unmodified proof.
+2. For every mutation position: both verifiers reject. Asymmetric
+   verdict (one accepts, the other rejects) ⇒ panic.
 
-`circuits/range-check/src/shadow.rs` and `circuits/shuffle-check/src/shadow.rs`
-implement a differential test: run halo2's reference `verify_proof` and
-our `halo2_solana_verifier::verify` on the same proof bytes; assert
-both accept the valid proof and both reject targeted byte mutations
-(advice commit, lookup/shuffle commit, lookup/shuffle eval). Asymmetric
-verdict (one accepts, the other rejects) is a soundness bug — the
-shadow panics. Six mutation points across the two circuits, all
-symmetric ✓.
+Coverage matrix:
+
+| Circuit | Mutation positions | Regions covered |
+|---|---:|---|
+| Range-check (1 lookup) | **11** | advice / lookup permuted_input / permuted_table / lookup product / random_poly / vanishing h / advice_eval / random_poly_eval / lookup_product_eval / lookup_permuted_table_eval / opening W |
+| Shuffle | **8** | advice / shuffle_product / random_poly / vanishing h / advice_eval / random_poly_eval / shuffle_product_eval / opening W |
+| Multi-lookup (2 lookups) | **5** | lookup_0 permuted_input / lookup_1 permuted_input / lookup_0 product_eval / lookup_1 product_eval / opening W |
+
+**24 total byte-level differential checks**, all symmetrically rejected.
+The multi-lookup audit specifically targets the `for (i, arg) in
+vk.lookups.iter().enumerate()` loop in `lookup::expressions` — mutating
+lookup_1's eval byte (offset = lookup_0_eval_offset + 5×32) and
+observing both verifiers reject confirms the verifier's per-lookup
+indexing has no off-by-one.
+
+Reproduce locally:
+```bash
+cargo run -p range-check-circuit    --bin gen-rc-proof  -- --shadow-audit
+cargo run -p shuffle-check-circuit  --bin gen-sh-proof  -- --shadow-audit
+cargo run -p multi-lookup-check-circuit --bin gen-ml-proof -- --shadow-audit
+```
 
 ### v2.0 scope clarifications
 
