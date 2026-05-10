@@ -4,6 +4,7 @@ members = [
     "crates/verifier",
     "crates/vk-host",
     "crates/g1-msm-ref",
+    "crates/fr-batch-inv-ref",
     "circuits/standard-plonk",
     "circuits/fibonacci",
     "circuits/range-check",
