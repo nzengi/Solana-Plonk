@@ -1,0 +1,8 @@
+target/
+vendor/
+Cargo.lock.bak
+.idea/
+.vscode/
+*.swp
+*.so
+test-ledger/

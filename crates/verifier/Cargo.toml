@@ -1,0 +1,36 @@
+[package]
+name        = "halo2-solana-verifier"
+version     = "0.1.0"
+description = "no_std PSE Halo2 (BN254/KZG) verifier for Solana BPF — PoC"
+edition.workspace    = true
+license.workspace    = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+default      = []
+# Use Solana alt_bn128 syscalls (BPF target). Off → fall back to arkworks-only host execution.
+solana-syscalls = ["dep:solana-program", "dep:solana-bn254"]
+# Devnet feature gates: SIMD-0302 (G2 ops), SIMD-0284 (LE byte order).
+# Until mainnet activates these we keep them behind a flag.
+devnet-feature-gates = []
+# Enable allocator on host targets that need std (tests).
+std = ["ark-bn254/std", "ark-ff/std", "ark-ec/std", "ark-serialize/std"]
+# Verifier-side eprintln of intermediate values for golden-vector debugging.
+# Implies `std`. Production builds must NOT enable this.
+debug-trace = ["std"]
+
+[dependencies]
+ark-bn254       = { workspace = true }
+ark-ff          = { workspace = true }
+ark-ec          = { workspace = true }
+ark-serialize   = { workspace = true }
+ark-std         = { workspace = true }
+
+solana-program  = { workspace = true, optional = true }
+solana-bn254    = { workspace = true, optional = true }
+
+[dev-dependencies]
+hex             = { workspace = true, features = ["std"] }

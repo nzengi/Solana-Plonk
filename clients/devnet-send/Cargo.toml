@@ -1,0 +1,22 @@
+[package]
+name        = "devnet-send"
+version     = "0.1.0"
+description = "Off-chain client: load golden vector, send verify tx to devnet"
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "devnet-send"
+path = "src/main.rs"
+
+[dependencies]
+solana-client                    = "3"
+solana-sdk                       = "3"
+solana-commitment-config         = "3"
+solana-compute-budget-interface  = "3"
+solana-program                   = { workspace = true }
+solana-system-interface          = { version = "3", features = ["bincode"] }
+bincode                          = "1"
+anyhow                           = "1"
+hex                              = { workspace = true, features = ["std"] }

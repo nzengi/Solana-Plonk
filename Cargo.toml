@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/verifier",
+    "crates/vk-host",
+    "crates/g1-msm-ref",
+    "circuits/standard-plonk",
+    "programs/verifier-program",
+    "programs/g1-msm-bench",
+    "clients/devnet-send",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# arkworks (no_std on BPF; host-side too)
+ark-bn254       = { version = "0.5", default-features = false, features = ["curve"] }
+ark-ff          = { version = "0.5", default-features = false }
+ark-ec          = { version = "0.5", default-features = false }
+ark-serialize   = { version = "0.5", default-features = false }
+ark-std         = { version = "0.5", default-features = false }
+
+# Solana — 4.x stack (latest); cargo-build-sbf 3.1.10 compiles these fine,
+# and mollusk-svm 0.12.1 is pinned to agave-4.0.
+solana-program  = "4"
+solana-bn254    = "3"
+
+# Pinocchio (BPF program framework, v1.5+ tasks)
+pinocchio       = "0.11"
+
+# Halo2 — host-side prover only (NOT compiled for BPF).
+# Pinned to PSE tag v0.3.0 to match snark-verifier v0.1.1's API surface.
+# v1.5 roadmap: bump to post-split halo2_backend layout.
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v0.3.0", default-features = false }
+halo2curves  = { version = "0.6", default-features = false, package = "halo2curves" }
+
+# Test infra (later tasks)
+mollusk-svm = "0.12"
+
+# Misc
+hex             = { version = "0.4", default-features = false, features = ["alloc"] }
+thiserror       = "1"
+
+[profile.release]
+overflow-checks = true
+# `lto = "thin"` rather than "fat": full LTO aggressively inlines into
+# the verifier's monolithic functions and pushes their BPF stack frames
+# past the 4096-byte SBF limit. Thin LTO keeps frame sizes manageable
+# while still giving good cross-crate optimization.
+lto             = "thin"
+codegen-units   = 1
+
+[profile.release-bpf]
+inherits        = "release"
+opt-level       = 3
+overflow-checks = false

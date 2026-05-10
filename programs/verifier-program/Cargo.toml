@@ -1,0 +1,38 @@
+[package]
+name        = "halo2-solana-verifier-program"
+version     = "0.1.0"
+description = "Solana BPF program wrapping halo2_solana_verifier::verify (Pinocchio entrypoint)"
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Build with the upstream Solana entrypoint (sol_log_, sol_panic_) — required
+# by `cargo build-sbf`. Off for host-side `cargo check` / unit tests.
+bpf-entrypoint = []
+# Replaces `verify()` with `Ok(())` no-op — confirms BPF VM + Mollusk plumbing
+# work at all, isolates verifier-side mysteries from infra ones.
+probe-noop = []
+# Probe stages: parse_vk only / parse_vk + read_proof / etc. Each strictly
+# extends the previous so the first one to exhaust CU pinpoints the offender.
+probe-parse-vk = []
+probe-read-proof = []
+# Run the FULL verify but with sol_log_compute_units_ checkpoints between
+# each stage. Produces a per-stage CU breakdown in the program log.
+stage-trace = []
+
+[dependencies]
+# `alloc` feature wires up the default allocator + panic handler used by
+# the `entrypoint!` macro; required because the verifier internally uses Vec.
+pinocchio              = { workspace = true, features = ["alloc"] }
+halo2-solana-verifier  = { path = "../../crates/verifier", default-features = false, features = ["solana-syscalls"] }
+ark-bn254              = { workspace = true }
+ark-ff                 = { workspace = true }
+
+[dev-dependencies]
+mollusk-svm   = { workspace = true }
+solana-program = { workspace = true }
