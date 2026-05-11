@@ -1978,7 +1978,10 @@ dependencies = [
  "halo2-solana-verifier",
  "mollusk-svm",
  "pinocchio",
+ "solana-account",
+ "solana-instruction",
  "solana-program 4.0.0",
+ "solana-pubkey 4.2.0",
 ]
 
 [[package]]

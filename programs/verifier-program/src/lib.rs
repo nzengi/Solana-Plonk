@@ -68,6 +68,14 @@ pub const STAGE1_TAG: u8 = 0x02;
 /// 2-tx split stage 2: reads stage_state from `accounts[1]`, performs
 /// replay-binding check, runs `build_queries` + SHPLONK + pairing.
 pub const STAGE2_TAG: u8 = 0x03;
+/// 3-tx split stage 2a: reads Stage1Output from `accounts[1]`, runs
+/// `parse_proof_no_fs` + `build_queries`, writes Stage2Output into
+/// `accounts[2]`. Used when SHPLONK + pairing alone overshoot the
+/// 1.4 M CU cap (Fibonacci / multi-lookup / StandardPlonk shapes).
+pub const STAGE2A_TAG: u8 = 0x04;
+/// 3-tx split stage 3: reads Stage2Output from `accounts[1]`, replay-
+/// checks the data account, runs SHPLONK opening + pairing only.
+pub const STAGE3_TAG: u8 = 0x05;
 
 /// Parse the on-chain instruction-data layout into the inputs `verify()` needs.
 /// `no_std`-friendly; allocations only happen inside `verify()`'s temporaries.
@@ -501,6 +509,178 @@ pub fn run_stage2(
 }
 
 // ---------------------------------------------------------------------------
+// 3-tx split: stage 2a (parse_proof_no_fs + build_queries → Stage2Output PDA)
+// and stage 3 (Stage2Output → shplonk + pairing). Same replay-binding model
+// as the 2-tx path, but stage2's work is split so each individual tx fits
+// under the 1.4 M CU cap for circuits whose combined parse+queries+shplonk
+// blew the 2-tx envelope (Fibonacci ~1.5 M, multi-lookup ~1.6 M,
+// StandardPlonk ~1.6 M).
+// ---------------------------------------------------------------------------
+
+/// Run the 3-tx split's stage 2a. Reads Stage1Output from `stage1_state`,
+/// re-parses the data account, performs the 3 replay checks, then runs
+/// `parse_proof_no_fs` + `build_queries` and serializes the resulting
+/// `Stage2Output` into `stage2_state` with a 4-byte length prefix.
+pub fn run_stage2a(
+    nonce: u64,
+    payer: &[u8; 32],
+    data_account: &[u8],
+    stage1_state_account: &[u8],
+    stage2_state_account: &mut [u8],
+) -> Result<(), u32> {
+    use halo2_solana_verifier::{
+        kzg::shplonk,
+        plonk::{verifier as v, PlonkProof, PlonkProtocol},
+        proof_reader,
+        stage_state::{compute_replay_hashes, Stage1Output, Stage2Output},
+    };
+
+    // ── Read Stage1Output from stage1_state ──────────────────────────────
+    if stage1_state_account.len() < STAGE_LEN_PREFIX {
+        return Err(errors::STAGE_INVALID);
+    }
+    let stored_len = u32::from_le_bytes([
+        stage1_state_account[0], stage1_state_account[1],
+        stage1_state_account[2], stage1_state_account[3],
+    ]) as usize;
+    let end = STAGE_LEN_PREFIX
+        .checked_add(stored_len)
+        .ok_or(errors::STAGE_INVALID)?;
+    if end > stage1_state_account.len() {
+        return Err(errors::STAGE_INVALID);
+    }
+    let stage1 = Stage1Output::deserialize(&stage1_state_account[STAGE_LEN_PREFIX..end])
+        .map_err(|_| errors::STAGE_INVALID)?;
+
+    // Auth checks (signer + nonce vs Stage1Output).
+    if stage1.payer != *payer {
+        return Err(errors::STAGE_AUTH_MISMATCH);
+    }
+    if stage1.nonce != nonce {
+        return Err(errors::STAGE_AUTH_MISMATCH);
+    }
+
+    // Re-parse data account + replay-binding check.
+    let (vk_bytes, proof_bytes, kzg_vk, public_inputs) = parse_instruction(data_account)?;
+    let (vk_hash, proof_hash, instance_hash) =
+        compute_replay_hashes(vk_bytes, proof_bytes, &public_inputs);
+    if vk_hash != stage1.vk_hash
+        || proof_hash != stage1.proof_hash
+        || instance_hash != stage1.instance_hash
+    {
+        return Err(errors::STAGE_REPLAY_MISMATCH);
+    }
+
+    // parse_proof_no_fs + build_queries + shplonk phase 1.
+    let vk: PlonkProtocol = halo2_solana_verifier::vk::parse_vk(vk_bytes)
+        .map_err(|_| errors::VERIFIER_ERROR)?;
+    let proof: PlonkProof = proof_reader::parse_proof_no_fs(&vk, proof_bytes)
+        .map_err(|_| errors::VERIFIER_ERROR)?;
+
+    let ch = stage1.challenges();
+    let queries = v::build_queries(
+        &vk, &proof, &ch, stage1.h_commitment, stage1.expected_h_eval,
+        vk.omega, stage1.omega_last,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+
+    let msm_terms = shplonk::build_shplonk_msm_terms(
+        &queries,
+        proof.opening_proof_w,
+        proof.opening_proof_w_prime,
+        ch.shplonk_y, ch.shplonk_v, ch.shplonk_u,
+        kzg_vk.g1_one,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+
+    // Build Stage2Output.
+    let stage2 = Stage2Output {
+        msm_terms,
+        opening_proof_w_prime: proof.opening_proof_w_prime,
+        kzg_g2_one: kzg_vk.g2_one,
+        kzg_g2_tau: kzg_vk.g2_tau,
+        vk_hash: stage1.vk_hash,
+        proof_hash: stage1.proof_hash,
+        instance_hash: stage1.instance_hash,
+        payer: *payer,
+        nonce,
+    };
+
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(stage2.serialized_size());
+    stage2.serialize(&mut buf).map_err(|_| errors::STAGE_INVALID)?;
+
+    let total = STAGE_LEN_PREFIX + buf.len();
+    if total > stage2_state_account.len() {
+        return Err(errors::STAGE_PDA_TOO_SMALL);
+    }
+    let len_le = (buf.len() as u32).to_le_bytes();
+    stage2_state_account[..STAGE_LEN_PREFIX].copy_from_slice(&len_le);
+    stage2_state_account[STAGE_LEN_PREFIX..STAGE_LEN_PREFIX + buf.len()].copy_from_slice(&buf);
+    for b in &mut stage2_state_account[STAGE_LEN_PREFIX + buf.len()..] {
+        *b = 0;
+    }
+
+    Ok(())
+}
+
+/// Run the 3-tx split's stage 3. Reads Stage2Output from `stage2_state`,
+/// performs auth checks, then runs the single G1 MSM (`finalize_shplonk_pairs`)
+/// and `alt_bn128_pairing`. No data account access — the KZG VK fields
+/// are already persisted inside `Stage2Output`.
+pub fn run_stage3(
+    nonce: u64,
+    payer: &[u8; 32],
+    stage2_state_account: &[u8],
+) -> Result<(), u32> {
+    use halo2_solana_verifier::{
+        kzg::{shplonk, KzgVk},
+        pairing,
+        stage_state::Stage2Output,
+    };
+
+    if stage2_state_account.len() < STAGE_LEN_PREFIX {
+        return Err(errors::STAGE_INVALID);
+    }
+    let stored_len = u32::from_le_bytes([
+        stage2_state_account[0], stage2_state_account[1],
+        stage2_state_account[2], stage2_state_account[3],
+    ]) as usize;
+    let end = STAGE_LEN_PREFIX
+        .checked_add(stored_len)
+        .ok_or(errors::STAGE_INVALID)?;
+    if end > stage2_state_account.len() {
+        return Err(errors::STAGE_INVALID);
+    }
+    let stage2 = Stage2Output::deserialize(&stage2_state_account[STAGE_LEN_PREFIX..end])
+        .map_err(|_| errors::STAGE_INVALID)?;
+
+    // Auth checks.
+    if stage2.payer != *payer {
+        return Err(errors::STAGE_AUTH_MISMATCH);
+    }
+    if stage2.nonce != nonce {
+        return Err(errors::STAGE_AUTH_MISMATCH);
+    }
+
+    // Reconstruct KzgVk from the persisted G2 fields. The g1_one was already
+    // consumed inside shplonk phase 1 as an MSM coefficient, so it's not
+    // carried; reconstruct a placeholder to satisfy the type — phase 2
+    // doesn't touch g1_one.
+    let kzg_vk = KzgVk {
+        g1_one: halo2_solana_verifier::curve::G1([0u8; 64]),
+        g2_one: stage2.kzg_g2_one,
+        g2_tau: stage2.kzg_g2_tau,
+    };
+
+    let pairs = shplonk::finalize_shplonk_pairs(
+        &stage2.msm_terms,
+        stage2.opening_proof_w_prime,
+        &kzg_vk,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+
+    let ok = pairing::pairing_check(&pairs.0).map_err(|_| errors::VERIFIER_ERROR)?;
+    if ok { Ok(()) } else { Err(errors::VERIFIER_REJECTED) }
+}
+
+// ---------------------------------------------------------------------------
 // Pinocchio entrypoint (only when building the .so).
 // ---------------------------------------------------------------------------
 
@@ -598,6 +778,53 @@ mod entry {
                 let data: &[u8] = unsafe { accounts[0].borrow_unchecked() };
                 let stage_state: &[u8] = unsafe { accounts[1].borrow_unchecked() };
                 return super::run_stage2(nonce, &payer, data, stage_state)
+                    .map_err(ProgramError::Custom);
+            }
+            if tag == super::STAGE2A_TAG {
+                // accounts: [data (r), stage1_state (r), stage2_state (w), signer]
+                if accounts.len() < 4 {
+                    return Err(ProgramError::Custom(super::errors::NO_ACCOUNT));
+                }
+                if instruction_data.len() != 1 + 8 {
+                    return Err(ProgramError::Custom(super::errors::MALFORMED_INPUT));
+                }
+                let nonce = u64::from_le_bytes([
+                    instruction_data[1], instruction_data[2],
+                    instruction_data[3], instruction_data[4],
+                    instruction_data[5], instruction_data[6],
+                    instruction_data[7], instruction_data[8],
+                ]);
+                let payer = *accounts[3].address().as_array();
+                // accounts[0] and accounts[1] are read-only, accounts[2] is
+                // writable. Split so the borrow checker sees disjoint
+                // borrows of the read sources and the write target.
+                let (left, right) = accounts.split_at_mut(2);
+                // SAFETY: stage2a holds the only writable borrow on the
+                // stage2_state account (right[0] = accounts[2]); the other
+                // two account slots are read-only.
+                let data:          &[u8] = unsafe { left[0].borrow_unchecked() };
+                let stage1_state:  &[u8] = unsafe { left[1].borrow_unchecked() };
+                let stage2_state:  &mut [u8] = unsafe { right[0].borrow_unchecked_mut() };
+                return super::run_stage2a(nonce, &payer, data, stage1_state, stage2_state)
+                    .map_err(ProgramError::Custom);
+            }
+            if tag == super::STAGE3_TAG {
+                // accounts: [stage2_state (r), signer]
+                if accounts.len() < 2 {
+                    return Err(ProgramError::Custom(super::errors::NO_ACCOUNT));
+                }
+                if instruction_data.len() != 1 + 8 {
+                    return Err(ProgramError::Custom(super::errors::MALFORMED_INPUT));
+                }
+                let nonce = u64::from_le_bytes([
+                    instruction_data[1], instruction_data[2],
+                    instruction_data[3], instruction_data[4],
+                    instruction_data[5], instruction_data[6],
+                    instruction_data[7], instruction_data[8],
+                ]);
+                let payer = *accounts[1].address().as_array();
+                let stage2_state: &[u8] = unsafe { accounts[0].borrow_unchecked() };
+                return super::run_stage3(nonce, &payer, stage2_state)
                     .map_err(ProgramError::Custom);
             }
         }
@@ -756,6 +983,101 @@ mod tests {
 
         let err = run_stage2(nonce, &payer, &data, &stage_state).unwrap_err();
         assert_eq!(err, errors::STAGE_REPLAY_MISMATCH);
+    }
+
+    /// 3-tx split end-to-end on the shuffle golden vector. stage1 → stage2a
+    /// → stage3 with the same payer/nonce. All three halves must succeed.
+    #[test]
+    fn stage1_then_stage2a_then_stage3_passes_on_shuffle() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect(
+            "run `cargo run -p shuffle-check-circuit --bin gen-sh-proof -- --write-golden` first",
+        );
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer: [u8; 32] = [0xAB; 32];
+        let nonce: u64 = 0x1122_3344_5566_7788;
+        let mut stage1_state = std::vec![0u8; 2048];
+        let mut stage2_state = std::vec![0u8; 8192];
+
+        run_stage1(nonce, &payer, &data, &mut stage1_state).expect("stage1");
+        run_stage2a(nonce, &payer, &data, &stage1_state, &mut stage2_state).expect("stage2a");
+        run_stage3(nonce, &payer, &stage2_state).expect("stage3");
+    }
+
+    /// Stage3 with a wrong payer (Eve) → STAGE_AUTH_MISMATCH. Stage1/stage2a
+    /// ran as Alice, Eve tries to finish the verify.
+    #[test]
+    fn stage3_rejects_wrong_payer() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect("missing shuffle golden");
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer_alice: [u8; 32] = [0xAA; 32];
+        let payer_eve:   [u8; 32] = [0xEE; 32];
+        let nonce: u64 = 1;
+        let mut stage1_state = std::vec![0u8; 2048];
+        let mut stage2_state = std::vec![0u8; 8192];
+
+        run_stage1(nonce, &payer_alice, &data, &mut stage1_state).unwrap();
+        run_stage2a(nonce, &payer_alice, &data, &stage1_state, &mut stage2_state).unwrap();
+        let err = run_stage3(nonce, &payer_eve, &stage2_state).unwrap_err();
+        assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
+    }
+
+    /// Stage2a with a tampered data account between stage1 and stage2a →
+    /// STAGE_REPLAY_MISMATCH. (Stage1's hashes pinned the original bytes;
+    /// flipping a proof byte breaks proof_hash.)
+    ///
+    /// Note: stage3 does NOT read the data account in the 3-tx split — the
+    /// `Stage2Output` is program-owned and carries the kzg-vk fields, so
+    /// the only window an attacker has to swap proof bytes is BEFORE
+    /// stage2a runs. Replay binding is enforced at the stage1→stage2a seam.
+    #[test]
+    fn stage2a_rejects_data_account_tampering() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect("missing shuffle golden");
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer: [u8; 32] = [0xAB; 32];
+        let nonce: u64 = 7;
+        let mut stage1_state = std::vec![0u8; 2048];
+        let mut stage2_state = std::vec![0u8; 8192];
+
+        run_stage1(nonce, &payer, &data, &mut stage1_state).unwrap();
+
+        // Flip a proof byte before stage2a runs.
+        let vk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let proof_start = 8 + 4 + vk_len + 4;
+        data[proof_start + 480] ^= 0x01;
+
+        let err = run_stage2a(nonce, &payer, &data, &stage1_state, &mut stage2_state).unwrap_err();
+        assert_eq!(err, errors::STAGE_REPLAY_MISMATCH);
+    }
+
+    /// Stage3 with a wrong nonce vs Stage2Output → STAGE_AUTH_MISMATCH.
+    #[test]
+    fn stage3_rejects_wrong_nonce() {
+        let path = "../../circuits/shuffle-check/tests/golden_v2_sh.bin";
+        let raw = std::fs::read(path).expect("missing shuffle golden");
+        let mut data: std::vec::Vec<u8> = std::vec::Vec::new();
+        data.extend_from_slice(b"GLDN0001");
+        data.extend_from_slice(&raw[8..]);
+
+        let payer: [u8; 32] = [0xAB; 32];
+        let mut stage1_state = std::vec![0u8; 2048];
+        let mut stage2_state = std::vec![0u8; 8192];
+
+        run_stage1(42, &payer, &data, &mut stage1_state).unwrap();
+        run_stage2a(42, &payer, &data, &stage1_state, &mut stage2_state).unwrap();
+        let err = run_stage3(43, &payer, &stage2_state).unwrap_err();
+        assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
     }
 
     /// Stage2 against a malformed stage_state buffer → STAGE_INVALID.

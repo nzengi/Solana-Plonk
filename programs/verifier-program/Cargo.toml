@@ -36,3 +36,8 @@ ark-ff                 = { workspace = true }
 [dev-dependencies]
 mollusk-svm   = { workspace = true }
 solana-program = { workspace = true }
+# Mollusk 0.12 takes `Account` and `Pubkey` from the post-4.0 split crates.
+# We need the matching types when threading account state through a 3-tx chain.
+solana-account = "3.4"
+solana-pubkey  = "4"
+solana-instruction = "3"

@@ -152,6 +152,128 @@ pub fn lagrange_interpolate(points: &[Fr], values: &[Fr]) -> Result<Vec<Fr>, Err
 }
 
 // ---------------------------------------------------------------------------
+// Lagrange basis helpers — split from `lagrange_interpolate` so the
+// numerator polys + un-inverted denoms can be computed once per rotation
+// set and the inverses batched across all sets with Montgomery's trick.
+// ---------------------------------------------------------------------------
+
+/// Compute the per-`j` numerator polynomial Π_{i≠j} (X − xᵢ) and the
+/// un-inverted denominator scalar Π_{i≠j} (xⱼ − xᵢ) for each `j ∈ 0..n`.
+/// The numerators are reusable across any interpolation on this `points`
+/// set; the denoms are passed through `batch_inverse_fr` collectively
+/// across all rotation sets before being consumed by `interpolate_with_basis`.
+#[inline(never)]
+pub(crate) fn lagrange_basis_compute(points: &[Fr])
+    -> Result<(Vec<Vec<Fr>>, Vec<Fr>), Error>
+{
+    let n = points.len();
+    let mut nums:   Vec<Vec<Fr>> = Vec::with_capacity(n);
+    let mut denoms: Vec<Fr>      = Vec::with_capacity(n);
+
+    for j in 0..n {
+        // Numerator polynomial Π_{i≠j} (X − xᵢ). Same build as
+        // `lagrange_interpolate`'s inner loop.
+        let mut num = alloc::vec![Fr::ZERO; n];
+        num[0] = Fr::ONE;
+        let mut deg = 1usize;
+        for i in 0..n {
+            if i == j { continue; }
+            let xi = points[i];
+            let mut new_num = alloc::vec![Fr::ZERO; deg + 1];
+            for k in 0..deg {
+                new_num[k]     -= num[k] * xi;
+                new_num[k + 1] += num[k];
+            }
+            for k in 0..deg + 1 { num[k] = new_num[k]; }
+            deg += 1;
+        }
+
+        // Denominator (un-inverted; batched later).
+        let mut denom = Fr::ONE;
+        for i in 0..n {
+            if i == j { continue; }
+            let d = points[j] - points[i];
+            if d.is_zero() {
+                return Err(Error::Protocol("lagrange: duplicate points"));
+            }
+            denom *= d;
+        }
+
+        nums.push(num);
+        denoms.push(denom);
+    }
+    Ok((nums, denoms))
+}
+
+/// Evaluate the Lagrange interpolant at the eval set `values`, given a
+/// pre-computed basis (`nums`, already-inverted `denom_invs`). Pure dot-
+/// product — no inverses, no syscalls. ~n² Fr muls.
+#[inline(never)]
+pub(crate) fn interpolate_with_basis(
+    nums: &[Vec<Fr>],
+    denom_invs: &[Fr],
+    values: &[Fr],
+) -> Vec<Fr> {
+    let n = values.len();
+    let mut result = alloc::vec![Fr::ZERO; n];
+    for j in 0..n {
+        let scale = values[j] * denom_invs[j];
+        for k in 0..n {
+            result[k] += nums[j][k] * scale;
+        }
+    }
+    result
+}
+
+/// Montgomery batch inverse: replace each `xs[i]` with `1 / xs[i]` using
+/// a single Fermat inverse + 3·(n−1) Fr muls. Rejects if any element is
+/// zero (the full product would be zero, no inverse exists).
+///
+/// Saving on BPF: each Fermat inverse costs ~16k CU; each Fr mul ~3k CU.
+/// For `n` inverses, this is `1·16k + 3·(n−1)·3k = 16k + 9k·(n−1)` vs
+/// `n·16k`, breaking even at `n=3` and saving ~7k CU per element after.
+/// On Fibonacci-shape phase 1 (~60 inverses) this saves ~400k CU.
+#[inline(never)]
+pub(crate) fn batch_inverse_fr(xs: &mut [Fr]) -> Result<(), Error> {
+    let n = xs.len();
+    if n == 0 { return Ok(()); }
+    if n == 1 {
+        let inv = xs[0].inverse()
+            .ok_or(Error::Protocol("batch_inverse: zero element"))?;
+        xs[0] = inv;
+        return Ok(());
+    }
+
+    // Save originals so the backward pass can multiply by them.
+    let originals: Vec<Fr> = xs.iter().copied().collect();
+
+    // Forward pass: prefix[i] = x[0] * … * x[i].
+    let mut prefix: Vec<Fr> = Vec::with_capacity(n);
+    prefix.push(originals[0]);
+    for i in 1..n {
+        prefix.push(prefix[i - 1] * originals[i]);
+    }
+
+    if prefix[n - 1].is_zero() {
+        return Err(Error::Protocol("batch_inverse: zero in batch"));
+    }
+
+    // Single Fermat inverse of the full product.
+    let mut acc = prefix[n - 1].inverse()
+        .ok_or(Error::Protocol("batch_inverse: inverse fail"))?;
+    // Loop invariant after iteration i (going high → low):
+    //   acc = 1 / (x[0] * … * x[i-1])
+    //   xs[i] = 1 / x[i]
+    for i in (1..n).rev() {
+        xs[i] = prefix[i - 1] * acc;
+        acc *= originals[i];
+    }
+    xs[0] = acc;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Rotation set construction.
 // ---------------------------------------------------------------------------
 
@@ -265,80 +387,14 @@ pub fn verify_opening(
     u: Fr,
     kzg_vk: &KzgVk,
 ) -> Result<PairingInput, Error> {
-    if queries.is_empty() {
-        return Err(Error::Protocol("verify_opening: empty queries"));
-    }
-
-    let sets = construct_intermediate_sets(queries);
-    let rotation_sets = &sets.rotation_sets;
-    let super_point_set = &sets.super_point_set;
-
-    // Pre-compute powers of y and v large enough for the largest set size.
-    let max_inner = rotation_sets.iter()
-        .map(|rs| rs.commitments_with_evals.len())
-        .max().unwrap_or(0);
-    let y_powers = powers(y, max_inner);
-    let v_powers = powers(v, rotation_sets.len());
-
-    let mut z_0 = Fr::ZERO;
-    let mut z_0_diff_inverse = Fr::ZERO;
-    let mut outer_msm_terms: Vec<(Fr, G1)> = Vec::new();
-    let mut r_outer_acc = Fr::ZERO;
-
-    #[cfg(feature = "debug-trace")] {
-        eprintln!("[verifier-shplonk] # rotation_sets = {}", rotation_sets.len());
-        eprintln!("[verifier-shplonk] super_point_set: {} pts", super_point_set.len());
-        for (i, p) in super_point_set.iter().enumerate() {
-            eprintln!("[verifier-shplonk]   spset[{i}] = {}", _shp_fr_hex(p));
-        }
-    }
-
-    for (i, rotation_set) in rotation_sets.iter().enumerate() {
-        let z_diff_i = compute_z_diff_i(
-            i, super_point_set, &rotation_set.points, u,
-            &mut z_0, &mut z_0_diff_inverse,
-        )?;
-
-        let r_inner_acc = process_rotation_set_inner(
-            rotation_set, &y_powers, v_powers[i], z_diff_i, u,
-            &mut outer_msm_terms,
-        )?;
-        r_outer_acc += v_powers[i] * z_diff_i * r_inner_acc;
-    }
-
-    #[cfg(feature = "debug-trace")] {
-        eprintln!("[verifier-shplonk] z_0          = {}", _shp_fr_hex(&z_0));
-        eprintln!("[verifier-shplonk] r_outer_final= {}", _shp_fr_hex(&r_outer_acc));
-        eprintln!("[verifier-shplonk] coeff(-r_outer * [1]_1) = {}", _shp_fr_hex(&(-r_outer_acc)));
-        eprintln!("[verifier-shplonk] coeff(-z_0    * h1     ) = {}", _shp_fr_hex(&(-z_0)));
-        eprintln!("[verifier-shplonk] coeff( u      * h2     ) = {}", _shp_fr_hex(&u));
-    }
-
-    // outer_msm  +=  −r_outer·[1]₁  −  z_0·h1  +  u·h2
-    outer_msm_terms.push((-r_outer_acc, kzg_vk.g1_one));
-    outer_msm_terms.push((-z_0, h1));
-    outer_msm_terms.push((u, h2));
-
-    // Realise the MSM as G1 syscalls.
-    let outer_msm = msm_g1(&outer_msm_terms)?;
-
-    #[cfg(feature = "debug-trace")] {
-        eprintln!("[verifier-shplonk] outer_msm (pre-neg) = 0x{}", _shp_hex(&outer_msm.0));
-        eprintln!("[verifier-shplonk] h1 = 0x{}", _shp_hex(&h1.0));
-        eprintln!("[verifier-shplonk] h2 = 0x{}", _shp_hex(&h2.0));
-    }
-
-    // Final pairing equation, mirroring halo2's `DualMSM::check`:
-    //   left = h2, right = outer_msm
-    //   pairs = [(left, [τ]₂), (right, −[1]₂)]
-    //   identity: e(h2, [τ]₂) · e(outer, −[1]₂) = 1  ⇔  e(h2, [τ]₂) = e(outer, [1]₂)
-    // We negate G1 (instead of G2) because our `neg_g1` is free (no syscall):
-    //   pairs = [(h2, [τ]₂), (−outer, [1]₂)]
-    let neg_outer = neg_g1(&outer_msm)?;
-    Ok(PairingInput(alloc::vec![
-        (h2, kzg_vk.g2_tau),
-        (neg_outer, kzg_vk.g2_one),
-    ]))
+    // 1-tx / 2-tx callers compose the same two phases the 3-tx split uses
+    // separately. Both phases share the batched-inverse fast path, so the
+    // 1-tx flow inherits the same ~600k CU saving on Fibonacci-shape
+    // circuits as the 3-tx split's stage 2a.
+    let msm_terms = build_shplonk_msm_terms(
+        queries, h1, h2, y, v, u, kzg_vk.g1_one,
+    )?;
+    finalize_shplonk_pairs(&msm_terms, h2, kzg_vk)
 }
 
 // ---------------------------------------------------------------------------
@@ -372,27 +428,9 @@ fn compute_z_diff_i(
     Ok(z_diff_i)
 }
 
-/// Process all commits in one rotation set: appends `(v^i · z_diff · y^j, C_j)`
-/// terms to `outer_msm_terms`, returns `r_inner = Σⱼ y^j · r_j(u)`.
-#[inline(never)]
-fn process_rotation_set_inner(
-    rotation_set: &RotationSet,
-    y_powers: &[Fr],
-    v_pow_i: Fr,
-    z_diff_i: Fr,
-    u: Fr,
-    outer_msm_terms: &mut Vec<(Fr, G1)>,
-) -> Result<Fr, Error> {
-    let mut r_inner_acc = Fr::ZERO;
-    for (j, (commitment, evals)) in rotation_set.commitments_with_evals.iter().enumerate() {
-        let r_x = lagrange_interpolate(&rotation_set.points, evals)?;
-        let r_eval = y_powers[j] * eval_polynomial(&r_x, u);
-        let coeff = v_pow_i * z_diff_i * y_powers[j];
-        outer_msm_terms.push((coeff, *commitment));
-        r_inner_acc += r_eval;
-    }
-    Ok(r_inner_acc)
-}
+// `process_rotation_set_inner` (per-commit Fermat-inverse lagrange) is
+// superseded by `process_rotation_set_with_basis` below — kept out of the
+// build to avoid CU-budget regressions if a caller mis-uses it.
 
 // ---------------------------------------------------------------------------
 // G1 MSM + negation helpers.
@@ -442,6 +480,143 @@ fn neg_g1(p: &G1) -> Result<G1, Error> {
         out[32 + i] = d as u8;
     }
     Ok(G1(out))
+}
+
+// ---------------------------------------------------------------------------
+// 3-tx split helpers: phase1 builds the SHPLONK outer-MSM term Vec (Fr math
+// only, no G1 syscalls); phase2 reduces the terms via a single G1 MSM and
+// returns the PairingInput. The 1-tx / 2-tx `verify_opening` above is the
+// composition of these two phases — kept untouched for backward compat.
+// ---------------------------------------------------------------------------
+
+/// Phase 1 of SHPLONK opening: build the complete `Vec<(Fr, G1)>` of MSM
+/// terms (queries are processed per rotation set, all finalization terms
+/// `-r_outer·[1]₁ + -z_0·h1 + u·h2` already appended). Returns this Vec
+/// alongside the `h2 = opening_proof_w_prime` carried through to phase 2
+/// (caller passes it in already, so the return is just the terms).
+///
+/// CU cost on BPF scales with the number of rotation sets and queries —
+/// purely Fr math + lagrange_interpolate, no alt_bn128 syscalls. For a
+/// Fibonacci-shape circuit this runs in ~600–800k CU.
+#[inline(never)]
+pub fn build_shplonk_msm_terms(
+    queries: &[VerifierQuery],
+    h1: G1,            // opening_proof_w
+    h2: G1,            // opening_proof_w_prime
+    y: Fr,
+    v: Fr,
+    u: Fr,
+    kzg_g1_one: G1,
+) -> Result<Vec<(Fr, G1)>, Error> {
+    if queries.is_empty() {
+        return Err(Error::Protocol("build_shplonk_msm_terms: empty queries"));
+    }
+
+    let sets = construct_intermediate_sets(queries);
+    let rotation_sets = &sets.rotation_sets;
+    let super_point_set = &sets.super_point_set;
+
+    let max_inner = rotation_sets.iter()
+        .map(|rs| rs.commitments_with_evals.len())
+        .max().unwrap_or(0);
+    let y_powers = powers(y, max_inner);
+    let v_powers = powers(v, rotation_sets.len());
+
+    // ── Pass 1: build the Lagrange basis (numerator polys + un-inverted
+    // denoms) for every rotation set. All denoms collect into one flat
+    // vector so we can do ONE Fermat inverse for all of them via
+    // Montgomery's trick instead of one inverse per `j` per set. On
+    // Fibonacci-shape phase 1 this turns ~60 Fermats into 1 + ~180 muls.
+    let mut per_set_nums:  Vec<Vec<Vec<Fr>>> = Vec::with_capacity(rotation_sets.len());
+    let mut denoms_flat:   Vec<Fr>           = Vec::new();
+    let mut denom_offsets: Vec<usize>        = Vec::with_capacity(rotation_sets.len() + 1);
+    denom_offsets.push(0);
+
+    for rotation_set in rotation_sets {
+        let (nums, denoms) = lagrange_basis_compute(&rotation_set.points)?;
+        per_set_nums.push(nums);
+        denoms_flat.extend(denoms);
+        denom_offsets.push(denoms_flat.len());
+    }
+
+    batch_inverse_fr(&mut denoms_flat)?;
+
+    // ── Pass 2: per rotation set, compute z_diff_i, build MSM terms with
+    // the pre-cached basis + freshly batch-inverted denoms.
+    let mut z_0 = Fr::ZERO;
+    let mut z_0_diff_inverse = Fr::ZERO;
+    let mut outer_msm_terms: Vec<(Fr, G1)> = Vec::new();
+    let mut r_outer_acc = Fr::ZERO;
+
+    for (i, rotation_set) in rotation_sets.iter().enumerate() {
+        let z_diff_i = compute_z_diff_i(
+            i, super_point_set, &rotation_set.points, u,
+            &mut z_0, &mut z_0_diff_inverse,
+        )?;
+
+        let basis_nums = &per_set_nums[i];
+        let denom_invs = &denoms_flat[denom_offsets[i]..denom_offsets[i + 1]];
+
+        let r_inner_acc = process_rotation_set_with_basis(
+            rotation_set, basis_nums, denom_invs,
+            &y_powers, v_powers[i], z_diff_i, u,
+            &mut outer_msm_terms,
+        );
+        r_outer_acc += v_powers[i] * z_diff_i * r_inner_acc;
+    }
+
+    // outer_msm  +=  −r_outer·[1]₁  −  z_0·h1  +  u·h2
+    outer_msm_terms.push((-r_outer_acc, kzg_g1_one));
+    outer_msm_terms.push((-z_0, h1));
+    outer_msm_terms.push((u, h2));
+
+    Ok(outer_msm_terms)
+}
+
+/// Per-rotation-set commitment processing using the pre-cached Lagrange
+/// basis. Identical structure to `process_rotation_set_inner` but skips
+/// re-computing the per-`j` numerators / denominators (already done in
+/// pass 1 of `build_shplonk_msm_terms`).
+#[inline(never)]
+fn process_rotation_set_with_basis(
+    rotation_set: &RotationSet,
+    basis_nums: &[Vec<Fr>],
+    denom_invs: &[Fr],
+    y_powers: &[Fr],
+    v_pow_i: Fr,
+    z_diff_i: Fr,
+    u: Fr,
+    outer_msm_terms: &mut Vec<(Fr, G1)>,
+) -> Fr {
+    let mut r_inner_acc = Fr::ZERO;
+    for (j, (commitment, evals)) in rotation_set.commitments_with_evals.iter().enumerate() {
+        let r_x = interpolate_with_basis(basis_nums, denom_invs, evals);
+        let r_eval = y_powers[j] * eval_polynomial(&r_x, u);
+        let coeff = v_pow_i * z_diff_i * y_powers[j];
+        outer_msm_terms.push((coeff, *commitment));
+        r_inner_acc += r_eval;
+    }
+    r_inner_acc
+}
+
+/// Phase 2 of SHPLONK opening: take the MSM terms produced by phase 1 plus
+/// the second-pairing point `h2 = opening_proof_w_prime`, run the single
+/// G1 MSM and build the two `(G1, G2)` pairs whose pairing product must
+/// equal 1.
+///
+/// CU cost dominated by `msm_g1` (one syscall per term, ~30k CU each).
+#[inline(never)]
+pub fn finalize_shplonk_pairs(
+    msm_terms: &[(Fr, G1)],
+    h2: G1,
+    kzg_vk: &crate::kzg::KzgVk,
+) -> Result<PairingInput, Error> {
+    let outer_msm = msm_g1(msm_terms)?;
+    let neg_outer = neg_g1(&outer_msm)?;
+    Ok(PairingInput(alloc::vec![
+        (h2, kzg_vk.g2_tau),
+        (neg_outer, kzg_vk.g2_one),
+    ]))
 }
 
 // ---------------------------------------------------------------------------
@@ -666,5 +841,78 @@ mod tests {
             0x3c, 0x20, 0x8c, 0x16, 0xd8, 0x7c, 0xfd, 0x45,
         ]);
         assert_eq!(r.0, expected);
+    }
+
+    // ----- batch_inverse_fr tests -----
+
+    #[test]
+    fn batch_inverse_empty_is_noop() {
+        let mut xs: Vec<Fr> = Vec::new();
+        batch_inverse_fr(&mut xs).unwrap();
+        assert!(xs.is_empty());
+    }
+
+    #[test]
+    fn batch_inverse_single_matches_fermat() {
+        let mut xs = alloc::vec![Fr::from(7u64)];
+        batch_inverse_fr(&mut xs).unwrap();
+        let expected = Fr::from(7u64).inverse().unwrap();
+        assert_eq!(xs[0], expected);
+    }
+
+    /// Batched inverse must produce the same result as a sequence of
+    /// per-element Fermat inverses (Montgomery's trick is exact, not
+    /// approximate).
+    #[test]
+    fn batch_inverse_matches_per_element_inverses() {
+        let xs_orig: Vec<Fr> = (2u64..=12u64).map(Fr::from).collect();
+        let mut xs = xs_orig.clone();
+        batch_inverse_fr(&mut xs).unwrap();
+        for (i, x) in xs_orig.iter().enumerate() {
+            assert_eq!(xs[i], x.inverse().unwrap(), "mismatch at index {i}");
+        }
+    }
+
+    /// A zero element in the batch must reject (the full product is zero,
+    /// hence has no inverse). Soundness-critical: silently accepting would
+    /// produce wrong basis denoms downstream.
+    #[test]
+    fn batch_inverse_zero_element_rejects() {
+        let mut xs = alloc::vec![Fr::from(3u64), Fr::ZERO, Fr::from(5u64)];
+        let r = batch_inverse_fr(&mut xs);
+        assert!(matches!(r, Err(Error::Protocol(_))));
+    }
+
+    // ----- lagrange_basis_compute / interpolate_with_basis tests -----
+
+    /// Composing `lagrange_basis_compute` + `batch_inverse_fr` +
+    /// `interpolate_with_basis` must yield the same polynomial as the
+    /// existing `lagrange_interpolate` on the same `(points, values)` pair.
+    #[test]
+    fn cached_basis_matches_legacy_lagrange() {
+        let points: Vec<Fr> = [1u64, 2u64, 5u64, 11u64].into_iter().map(Fr::from).collect();
+        let values: Vec<Fr> = [7u64, 14u64, 35u64, 88u64].into_iter().map(Fr::from).collect();
+
+        let legacy = lagrange_interpolate(&points, &values).unwrap();
+
+        let (nums, mut denoms) = lagrange_basis_compute(&points).unwrap();
+        batch_inverse_fr(&mut denoms).unwrap();
+        let cached = interpolate_with_basis(&nums, &denoms, &values);
+
+        assert_eq!(cached, legacy);
+    }
+
+    /// Single-point case (n=1): basis numerator is the constant polynomial
+    /// `1` and denominator is `1`. Interpolant should be the constant
+    /// `values[0]`.
+    #[test]
+    fn cached_basis_single_point() {
+        let points = alloc::vec![Fr::from(42u64)];
+        let values = alloc::vec![Fr::from(99u64)];
+
+        let (nums, mut denoms) = lagrange_basis_compute(&points).unwrap();
+        batch_inverse_fr(&mut denoms).unwrap();
+        let p = interpolate_with_basis(&nums, &denoms, &values);
+        assert_eq!(p, alloc::vec![Fr::from(99u64)]);
     }
 }

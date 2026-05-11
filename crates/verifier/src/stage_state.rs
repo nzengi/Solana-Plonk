@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 use ark_bn254::Fr;
 
 use crate::{
-    curve::G1,
+    curve::{G1, G2},
     field::{fr_from_bytes_be, fr_to_bytes_be},
     plonk::{lagrange::LagrangeEvaluations, Challenges},
     Error,
@@ -38,6 +38,17 @@ use crate::{
 /// reject blobs from older verifier binaries.
 pub const STAGE_STATE_MAGIC: &[u8; 8] = b"STG10001";
 pub const STAGE_STATE_VERSION: u32 = 1;
+
+/// Magic prefix for a `Stage2Output` blob (3-tx split: stage2a → stage3).
+pub const STAGE2_STATE_MAGIC: &[u8; 8] = b"STG20001";
+pub const STAGE2_STATE_VERSION: u32 = 1;
+
+/// Hard cap on `Stage2Output::msm_terms.len()`. Stage 2a's
+/// `build_shplonk_msm_terms` produces one term per query plus three
+/// finalization terms (`-r_outer·[1]₁`, `-z_0·h1`, `u·h2`). For the
+/// reference circuits this stays under 50; 256 leaves headroom for
+/// larger halo2 shapes.
+pub const MAX_MSM_TERMS: usize = 256;
 
 /// Hard cap on `user_challenges.len()`. Prevents a malformed PDA from
 /// requesting an oversized allocation in deserialize. Real circuits use
@@ -272,6 +283,164 @@ impl Stage1Output {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 3-tx split: Stage2Output (handed from stage2a to stage3).
+//
+// The 3-tx split breaks verify into:
+//   * stage1   — parse_vk + read_proof + lagrange + expected_h_eval + h_commit
+//                + omega_last  → writes Stage1Output
+//   * stage2a  — read Stage1Output + parse_proof_no_fs + build_queries +
+//                `shplonk::build_shplonk_msm_terms` (phase 1: rotation-set
+//                algebra + lagrange interpolations, all Fr math)
+//                → writes Stage2Output
+//   * stage3   — read Stage2Output + `shplonk::finalize_shplonk_pairs`
+//                (phase 2: single G1 MSM) + `alt_bn128_pairing`
+//
+// Why splitting *inside* shplonk: pre-split measurement showed shplonk +
+// pairing alone hit ~1.5 M CU for Fibonacci, busting the 1.4 M cap even
+// when nothing else lived in stage3. The MSM is ~N syscalls of ~30 k CU
+// each; pushing the term-building (pure Fr math, ~600 k CU on Fibonacci)
+// into stage2a leaves stage3 with just the MSM syscalls and the pairing
+// (~800–900 k CU total).
+//
+// Replay binding. Stage3 doesn't read the data account — `Stage2Output`
+// is program-owned, so the program already validated its contents during
+// stage 2a. Stage3 only checks payer + nonce against the persisted values
+// (signer mismatch / nonce mismatch → STAGE_AUTH_MISMATCH).
+// ---------------------------------------------------------------------------
+
+/// Output of stage2a (parse_proof_no_fs + build_queries + shplonk phase 1).
+/// Stage3 consumes this to finish the SHPLONK MSM and run the pairing
+/// without needing the data account.
+#[derive(Clone, Debug)]
+pub struct Stage2Output {
+    /// Outer-MSM terms after shplonk phase 1, finalization terms already
+    /// appended. Stage3 feeds these into one `msm_g1` syscall.
+    pub msm_terms: Vec<(Fr, G1)>,
+
+    /// `h2 = opening_proof_w_prime` — needed as the first pairing-pair G1.
+    pub opening_proof_w_prime: G1,
+
+    /// KZG verification key fields persisted so stage3 doesn't need the
+    /// data account. `g1_one` was already consumed inside phase 1 as one
+    /// of the MSM terms, so it's not carried here.
+    pub kzg_g2_one: G2,
+    pub kzg_g2_tau: G2,
+
+    /// Replay-binding hashes — same triple Stage1Output carries. Forwarded
+    /// for diagnostic / external-binding use; stage3 doesn't re-derive them
+    /// because it doesn't read the data account.
+    pub vk_hash: [u8; 32],
+    pub proof_hash: [u8; 32],
+    pub instance_hash: [u8; 32],
+
+    /// 32-byte Solana pubkey of the verifier caller. Stage3 must be signed
+    /// by the same key.
+    pub payer: [u8; 32],
+    /// Per-attempt nonce; binds to the PDA seed across stages.
+    pub nonce: u64,
+}
+
+impl Stage2Output {
+    /// Wire size of one MSM term: Fr BE (32) + G1 (64) = 96 bytes.
+    pub const MSM_TERM_WIRE_SIZE: usize = 32 + 64;
+
+    /// Canonical byte representation. Returns `InvalidStageState` if
+    /// `msm_terms.len()` exceeds the cap.
+    pub fn serialize(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.msm_terms.len() > MAX_MSM_TERMS {
+            return Err(Error::InvalidStageState);
+        }
+
+        out.extend_from_slice(STAGE2_STATE_MAGIC);
+        out.extend_from_slice(&STAGE2_STATE_VERSION.to_le_bytes());
+
+        // msm_terms: u32 LE count, then n × { Fr 32 | G1 64 }.
+        out.extend_from_slice(&(self.msm_terms.len() as u32).to_le_bytes());
+        for (scalar, point) in &self.msm_terms {
+            out.extend_from_slice(&fr_to_bytes_be(scalar));
+            out.extend_from_slice(&point.0);
+        }
+
+        // SHPLONK opening h2 + KZG VK G2 fields.
+        out.extend_from_slice(&self.opening_proof_w_prime.0);
+        out.extend_from_slice(&self.kzg_g2_one.0);
+        out.extend_from_slice(&self.kzg_g2_tau.0);
+
+        // Replay-binding + authority.
+        out.extend_from_slice(&self.vk_hash);
+        out.extend_from_slice(&self.proof_hash);
+        out.extend_from_slice(&self.instance_hash);
+        out.extend_from_slice(&self.payer);
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+
+        Ok(())
+    }
+
+    /// Inverse of `serialize`. Strict: any trailing bytes, wrong magic /
+    /// version, or count > cap → `InvalidStageState`.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        let mut cur = 0usize;
+
+        let magic = read_array::<8>(bytes, &mut cur)?;
+        if &magic != STAGE2_STATE_MAGIC {
+            return Err(Error::InvalidStageState);
+        }
+        let version = read_u32_le(bytes, &mut cur)?;
+        if version != STAGE2_STATE_VERSION {
+            return Err(Error::InvalidStageState);
+        }
+
+        let n_t = read_u32_le(bytes, &mut cur)? as usize;
+        if n_t > MAX_MSM_TERMS {
+            return Err(Error::InvalidStageState);
+        }
+        let mut msm_terms = Vec::with_capacity(n_t);
+        for _ in 0..n_t {
+            let scalar = read_fr(bytes, &mut cur)?;
+            let point = G1(read_array::<64>(bytes, &mut cur)?);
+            msm_terms.push((scalar, point));
+        }
+
+        let opening_proof_w_prime = G1(read_array::<64>(bytes, &mut cur)?);
+        let kzg_g2_one = G2(read_array::<128>(bytes, &mut cur)?);
+        let kzg_g2_tau = G2(read_array::<128>(bytes, &mut cur)?);
+
+        let vk_hash = read_array::<32>(bytes, &mut cur)?;
+        let proof_hash = read_array::<32>(bytes, &mut cur)?;
+        let instance_hash = read_array::<32>(bytes, &mut cur)?;
+        let payer = read_array::<32>(bytes, &mut cur)?;
+        let nonce_bytes = read_array::<8>(bytes, &mut cur)?;
+        let nonce = u64::from_le_bytes(nonce_bytes);
+
+        if cur != bytes.len() {
+            return Err(Error::InvalidStageState);
+        }
+
+        Ok(Stage2Output {
+            msm_terms,
+            opening_proof_w_prime,
+            kzg_g2_one, kzg_g2_tau,
+            vk_hash, proof_hash, instance_hash,
+            payer, nonce,
+        })
+    }
+
+    /// Number of bytes the canonical serialization will produce.
+    pub fn serialized_size(&self) -> usize {
+        const FIXED: usize =
+              8                 // magic
+            + 4                 // version
+            + 4                 // msm_terms count
+            + 64                // opening_proof_w_prime
+            + 128 + 128         // kzg_g2_one + kzg_g2_tau
+            + 32 + 32 + 32      // 3 replay hashes
+            + 32                // payer
+            + 8;                // nonce
+        FIXED + Self::MSM_TERM_WIRE_SIZE * self.msm_terms.len()
+    }
+}
+
 /// Compute the three replay-binding hashes for a verify input. Stage1
 /// stores these in the PDA; stage2 re-runs this on the same data
 /// account and compares.
@@ -482,6 +651,129 @@ mod tests {
         let lag = s.lagrange();
         assert_eq!(lag.l_0, s.l_0);
         assert_eq!(lag.xn, s.xn);
+    }
+
+    // ----- Stage2Output tests -----
+
+    fn synth_term(seed: u8, scalar_val: u64) -> (Fr, G1) {
+        (fr_n(scalar_val), G1([seed; 64]))
+    }
+
+    fn synth_stage2() -> Stage2Output {
+        Stage2Output {
+            msm_terms: alloc::vec![
+                synth_term(1, 100),
+                synth_term(2, 101),
+                synth_term(3, 102),
+            ],
+            opening_proof_w_prime: G1([0xBB; 64]),
+            kzg_g2_one: G2([0xDD; 128]),
+            kzg_g2_tau: G2([0xEE; 128]),
+            vk_hash: [1u8; 32],
+            proof_hash: [2u8; 32],
+            instance_hash: [3u8; 32],
+            payer: [0xCC; 32],
+            nonce: 0x99AA_BBCC_DDEE_FF00,
+        }
+    }
+
+    /// Round-trip a fully-populated Stage2Output.
+    #[test]
+    fn stage2_roundtrip_full() {
+        let original = synth_stage2();
+        let mut bytes = Vec::new();
+        original.serialize(&mut bytes).unwrap();
+        let restored = Stage2Output::deserialize(&bytes).unwrap();
+
+        assert_eq!(restored.msm_terms.len(), original.msm_terms.len());
+        for (a, b) in restored.msm_terms.iter().zip(original.msm_terms.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1.0, b.1.0);
+        }
+        assert_eq!(restored.opening_proof_w_prime.0, original.opening_proof_w_prime.0);
+        assert_eq!(restored.kzg_g2_one.0, original.kzg_g2_one.0);
+        assert_eq!(restored.kzg_g2_tau.0, original.kzg_g2_tau.0);
+        assert_eq!(restored.vk_hash, original.vk_hash);
+        assert_eq!(restored.proof_hash, original.proof_hash);
+        assert_eq!(restored.instance_hash, original.instance_hash);
+        assert_eq!(restored.payer, original.payer);
+        assert_eq!(restored.nonce, original.nonce);
+    }
+
+    /// Empty msm_terms roundtrip (degenerate but byte-format must still work).
+    #[test]
+    fn stage2_roundtrip_no_terms() {
+        let original = Stage2Output { msm_terms: Vec::new(), ..synth_stage2() };
+        let mut bytes = Vec::new();
+        original.serialize(&mut bytes).unwrap();
+        let restored = Stage2Output::deserialize(&bytes).unwrap();
+        assert!(restored.msm_terms.is_empty());
+        assert_eq!(restored.nonce, original.nonce);
+    }
+
+    /// `serialized_size()` matches the buffer `serialize()` produces.
+    #[test]
+    fn stage2_serialized_size_matches() {
+        let original = synth_stage2();
+        let mut bytes = Vec::new();
+        original.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), original.serialized_size());
+    }
+
+    /// Wrong magic byte: deserialize must reject.
+    #[test]
+    fn stage2_wrong_magic_rejects() {
+        let mut bytes = Vec::new();
+        synth_stage2().serialize(&mut bytes).unwrap();
+        bytes[0] = b'X';
+        assert!(matches!(Stage2Output::deserialize(&bytes), Err(Error::InvalidStageState)));
+    }
+
+    /// Wrong version: deserialize must reject.
+    #[test]
+    fn stage2_wrong_version_rejects() {
+        let mut bytes = Vec::new();
+        synth_stage2().serialize(&mut bytes).unwrap();
+        bytes[8..12].copy_from_slice(&999u32.to_le_bytes());
+        assert!(matches!(Stage2Output::deserialize(&bytes), Err(Error::InvalidStageState)));
+    }
+
+    /// Trailing bytes: deserialize must reject.
+    #[test]
+    fn stage2_trailing_bytes_rejects() {
+        let mut bytes = Vec::new();
+        synth_stage2().serialize(&mut bytes).unwrap();
+        bytes.push(0xFF);
+        assert!(matches!(Stage2Output::deserialize(&bytes), Err(Error::InvalidStageState)));
+    }
+
+    /// Truncated input: deserialize must reject.
+    #[test]
+    fn stage2_truncated_rejects() {
+        let mut bytes = Vec::new();
+        synth_stage2().serialize(&mut bytes).unwrap();
+        bytes.truncate(bytes.len() - 1);
+        assert!(matches!(Stage2Output::deserialize(&bytes), Err(Error::InvalidStageState)));
+    }
+
+    /// msm_terms count over MAX_MSM_TERMS: serialize must reject.
+    #[test]
+    fn stage2_oversized_terms_rejects_serialize() {
+        let mut s = synth_stage2();
+        s.msm_terms = (0..(MAX_MSM_TERMS + 1)).map(|i| synth_term(0, i as u64)).collect();
+        let mut bytes = Vec::new();
+        assert!(matches!(s.serialize(&mut bytes), Err(Error::InvalidStageState)));
+    }
+
+    /// msm_terms count over MAX_MSM_TERMS on the wire: deserialize rejects (DoS bound).
+    #[test]
+    fn stage2_oversized_terms_rejects_deserialize() {
+        let mut bytes = Vec::new();
+        synth_stage2().serialize(&mut bytes).unwrap();
+        // msm_terms count u32 LE is just after magic (8) + version (4).
+        let off = 8 + 4;
+        bytes[off..off + 4].copy_from_slice(&((MAX_MSM_TERMS + 1) as u32).to_le_bytes());
+        assert!(matches!(Stage2Output::deserialize(&bytes), Err(Error::InvalidStageState)));
     }
 
     /// `compute_replay_hashes` is deterministic and distinct per input.

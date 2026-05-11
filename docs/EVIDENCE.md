@@ -30,6 +30,21 @@ this is the audit page.
    inner ix) and on success transfers **0.1 SOL** atomically — total
    1,065,591 CU, well under the 1.4 M cap.
 
+4. **Fibonacci lands end-to-end via the 3-tx split path** with
+   Montgomery batch-inverse refactor (Path B). All three stages
+   comfortably under 1.4 M cap:
+   stage 1 [`jSVJLXky…AmyJ`](https://explorer.solana.com/tx/jSVJLXkyoN8nFZxgLb1qjXfh7W29chDHmekckd6ywqh4zCmMRS9hFw6k9cBws7PfHcd8mRLnPqkAhLPZj2SAmyJ?cluster=devnet)
+   → 1,045,362 CU,
+   stage 2a [`3EpnmTga…dBCF`](https://explorer.solana.com/tx/3EpnmTgaereVeFqKgfZppDMJYxv5w5mPFuFWzEWtvDwTSifjoysf5R5v6JCpEKkGztQYdjVWpGjfbXZTUmFtdBCF?cluster=devnet)
+   → 792,606 CU,
+   stage 3 [`43kmVsZU…2z3i`](https://explorer.solana.com/tx/43kmVsZUePXKrPWCg2iSP7eDszgU2bTAjjVCjL5ecMCBkq7fvb4Tt4GUeJrYx3tmJNknmiUE6NLMhupc8geF2z3i?cluster=devnet)
+   → 227,160 CU.
+   **First halo2 verify path on Solana with shplonk + pairing fully
+   split into a self-contained third tx** (`Stage2Output` PDA carries
+   the persisted KZG VK G2 fields → stage 3 needs no data account).
+   The 1-tx Fibonacci attempt overshoots 1.4 M (1.65 M post-Path-B).
+   On-chain CU matches Mollusk to within 56 units per stage.
+
 ## Live on-chain artifacts (devnet)
 
 | What | Address / signature |
@@ -56,6 +71,25 @@ Plookup-using verifier to land end-to-end):
 Combined: 1,922,893 CU across two transactions, replay-bound by a
 per-payer PDA. See [`docs/2_tx_split.md`](2_tx_split.md) for the
 design + replay-protection mechanism.
+
+**Larger circuits via 3-tx split** (Fibonacci, the first halo2 verify
+to land with `shplonk + pairing` in a self-contained third tx):
+
+| Stage | Tx | Status | CU |
+|---|---|---|---:|
+| Fibonacci stage 1   | [`jSVJLXky…AmyJ`](https://explorer.solana.com/tx/jSVJLXkyoN8nFZxgLb1qjXfh7W29chDHmekckd6ywqh4zCmMRS9hFw6k9cBws7PfHcd8mRLnPqkAhLPZj2SAmyJ?cluster=devnet) | Ok | 1,045,362 |
+| Fibonacci stage 2a  | [`3EpnmTga…dBCF`](https://explorer.solana.com/tx/3EpnmTgaereVeFqKgfZppDMJYxv5w5mPFuFWzEWtvDwTSifjoysf5R5v6JCpEKkGztQYdjVWpGjfbXZTUmFtdBCF?cluster=devnet) | Ok |   792,606 |
+| Fibonacci stage 3   | [`43kmVsZU…2z3i`](https://explorer.solana.com/tx/43kmVsZUePXKrPWCg2iSP7eDszgU2bTAjjVCjL5ecMCBkq7fvb4Tt4GUeJrYx3tmJNknmiUE6NLMhupc8geF2z3i?cluster=devnet) | Ok |   227,160 |
+
+Combined: 2,065,128 CU across three transactions; replay-bound by
+two per-payer PDAs (stage1_state → stage2_state) and a shared nonce.
+The split point puts `shplonk_phase1` (rotation-set Fr math + batched
+Montgomery inverse) in stage 2a and `msm_g1 + alt_bn128_pairing` in
+stage 3, which only needs the stage 2 output PDA (no data account
+re-read). On-chain numbers match Mollusk within 56 CU per stage —
+no emulation drift. See `crates/verifier/src/stage_state.rs` for the
+`Stage2Output` byte format and `kzg/shplonk.rs::build_shplonk_msm_terms`
+for phase 1.
 
 ## Verifier rejects tampered proofs
 
