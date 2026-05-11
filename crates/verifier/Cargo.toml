@@ -13,9 +13,14 @@ crate-type = ["lib"]
 default      = []
 # Use Solana alt_bn128 syscalls (BPF target). Off → fall back to arkworks-only host execution.
 solana-syscalls = ["dep:solana-program", "dep:solana-bn254"]
-# Devnet feature gates: SIMD-0302 (G2 ops), SIMD-0284 (LE byte order).
-# Until mainnet activates these we keep them behind a flag.
+# Devnet feature gates: SIMD-0302 (G2 ops). Until mainnet activates these we
+# keep them behind a flag.
 devnet-feature-gates = []
+# Mainnet path (SIMD-0284 active): route alt_bn128 calls to the `_le` syscall
+# variants. Verifier-internal API stays BE — wrappers swap bytes at the
+# boundary, so existing in-tree call sites need no change. Requires
+# `solana-syscalls`.
+mainnet-le = ["solana-syscalls"]
 # Enable allocator on host targets that need std (tests).
 std = ["ark-bn254/std", "ark-ff/std", "ark-ec/std", "ark-serialize/std"]
 # Verifier-side eprintln of intermediate values for golden-vector debugging.

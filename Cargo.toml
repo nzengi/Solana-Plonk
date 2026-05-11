@@ -13,6 +13,7 @@ members = [
     "circuits/multi-lookup-check",
     "circuits/bound-range-check",
     "circuits/external-sp",
+    "circuits/multi-phase-check",
     "programs/verifier-program",
     "programs/g1-msm-bench",
     "programs/reward-pool",

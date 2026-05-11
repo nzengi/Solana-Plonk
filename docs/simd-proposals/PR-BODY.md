@@ -1,5 +1,16 @@
 # Add SIMD: `alt_bn128_g1_msm` syscall
 
+> **Status (v2.1, 2026-05):** the numbers in this PR body predate
+> the verifier's v2.1 Path B refactor (Montgomery batched inverse +
+> cached Lagrange basis in `kzg::shplonk`). After Path B and the
+> 3-tx split (Fibonacci end-to-end on devnet), every reference
+> circuit fits the 1.4 M per-tx cap and the verifier is no longer
+> blocked. The MSM syscall remains net positive (~15-20 % total
+> verify CU saving and the path to fold larger circuits back into a
+> single tx), but the case below is no longer "verifier cannot land
+> at all" — see [`docs/cu_profile.md`](../cu_profile.md) for the
+> updated profile.
+
 ## Summary
 
 This PR proposes a new BN254 G1 multi-scalar multiplication syscall — `alt_bn128_g1_msm` — to replace the pattern of calling `alt_bn128_g1_multiplication_be` n times followed by `alt_bn128_g1_addition_be` (n − 1) times. The proposal sits in the `alt_bn128_*` syscall series alongside [SIMD-0284](https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0284-alt-bn128-little-endian.md) (LE byte order) and [SIMD-0302](https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0302-bn254-g2-syscalls.md) (G2 syscalls).

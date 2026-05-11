@@ -14,6 +14,10 @@ default = []
 # Build with the upstream Solana entrypoint (sol_log_, sol_panic_) — required
 # by `cargo build-sbf`. Off for host-side `cargo check` / unit tests.
 bpf-entrypoint = []
+# Route alt_bn128 calls through `_le` syscall variants (SIMD-0284 mainnet
+# path). Wire format on the proof / VK / kzg-vk stays BE — the verifier
+# crate's wrappers swap bytes at the syscall boundary.
+mainnet-le = ["halo2-solana-verifier/mainnet-le"]
 # Replaces `verify()` with `Ok(())` no-op — confirms BPF VM + Mollusk plumbing
 # work at all, isolates verifier-side mysteries from infra ones.
 probe-noop = []

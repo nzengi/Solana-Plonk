@@ -19,6 +19,21 @@ Add a single Solana BPF syscall that computes `(s₁⁻¹, …, sₙ⁻¹)` over
 
 This is the natural Layer 3 follow-up to [`alt_bn128_g1_msm`](./simd-XXXX-alt-bn128-g1-msm.md). Where the G1 MSM syscall targets the verifier's commitment-combining cost, this syscall targets the **scalar-field inverse cost** that dominates Lagrange evaluation, KZG opening preparation, and any verifier with grand-product polynomials. Together they collapse Halo2 verify-time onto Solana's single-tx CU budget.
 
+> **Status update (v2.1, 2026-05):** the `halo2-solana-verifier` repo
+> has since landed a **software-side Montgomery batch-inverse** in
+> `kzg::shplonk::build_shplonk_msm_terms` (the "Path B" refactor —
+> see [`docs/cu_profile.md`](../cu_profile.md)). On Fibonacci-shape
+> circuits the software fix turned ~60 Fermat inverses into 1 Fermat
+> + ~180 Fr muls, saving ~400 k CU. So the case below is no longer
+> "the verifier cannot fit at all without this syscall" — the 3-tx
+> split + Path B already let every reference circuit verify
+> end-to-end (Fibonacci 3-tx live on devnet at 2.07 M total CU). The
+> case is now **"a native syscall would save another ~400 k CU on
+> top of the software Path B"** because per-Fr-mul cost on BPF is
+> ~3 k CU vs the projected `4 000 + n × 200` for a syscall. The
+> motivation numbers below predate Path B and remain the right
+> per-stage analysis of where Fr-inverse cost lives in the verifier.
+
 ## Motivation
 
 The existing scalar-field arithmetic primitives in pure BPF (via `arkworks-bn254`'s constant-time Montgomery extended-Euclidean) cost **~100,000 CU per Fr inverse** on the SBF VM. There is no native syscall for Fr inverses today — every modular inverse runs as 256-bit big-integer math compiled to BPF instructions.

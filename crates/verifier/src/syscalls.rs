@@ -28,32 +28,126 @@ use crate::Error;
 #[cfg(feature = "solana-syscalls")]
 mod onchain {
     use super::Error;
+    #[cfg(not(feature = "mainnet-le"))]
     use solana_bn254::prelude::{
         alt_bn128_g1_addition_be, alt_bn128_g1_multiplication_be, alt_bn128_pairing_be,
     };
+    #[cfg(feature = "mainnet-le")]
+    use solana_bn254::prelude::{
+        alt_bn128_g1_addition_le, alt_bn128_g1_multiplication_le, alt_bn128_pairing_le,
+    };
+
+    // BE ↔ LE byte-swap helpers (mainnet-le path). Matches solana-bn254's
+    // `convert_endianness::<CHUNK, ARRAY>` semantics: reverse bytes within
+    // each fixed-size field-element chunk.
+    //
+    // G1 (64 B): two 32-byte Fq chunks (x, y) reversed individually.
+    // G2 (128 B): two 64-byte chunks (x = c1‖c0, y = c1‖c0) reversed as 64-byte
+    //              spans, which both flips byte order AND swaps c0 / c1 outer
+    //              positions — matches solana-bn254's `<64, 128>` shape.
+    // Fr (32 B): single 32-byte reversal.
+    #[cfg(feature = "mainnet-le")]
+    #[inline]
+    fn swap_g1(bytes: &[u8; 64]) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        for c in 0..2 {
+            for i in 0..32 {
+                out[c * 32 + i] = bytes[c * 32 + (31 - i)];
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "mainnet-le")]
+    #[inline]
+    fn swap_fr(bytes: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 { out[i] = bytes[31 - i]; }
+        out
+    }
+
+    /// Swap an in-line `(G1 ‖ G2)` 192-byte pairing-input chunk between BE
+    /// and LE. Per solana-bn254's `convert_endianness::<64, 128>` for G2,
+    /// the operation is byte-reverse-within-64-byte-spans — which both
+    /// flips byte order AND swaps the (c1, c0) outer positions of each
+    /// Fq2 coordinate. Apply to G1's two 32-byte halves and G2's two
+    /// 64-byte halves of one chunk.
+    #[cfg(feature = "mainnet-le")]
+    fn swap_pair_chunk(chunk: &[u8], out: &mut [u8]) {
+        debug_assert_eq!(chunk.len(), 192);
+        debug_assert_eq!(out.len(), 192);
+        // G1: 64 B = 2 × 32 B Fq
+        for c in 0..2 {
+            for i in 0..32 {
+                out[c * 32 + i] = chunk[c * 32 + (31 - i)];
+            }
+        }
+        // G2: 128 B = 2 × 64 B Fq2 spans
+        for c in 0..2 {
+            let base = 64 + c * 64;
+            for i in 0..64 {
+                out[base + i] = chunk[base + (63 - i)];
+            }
+        }
+    }
 
     pub fn g1_add(a: &[u8; 64], b: &[u8; 64]) -> Result<[u8; 64], Error> {
         let mut input = [0u8; 128];
         input[..64].copy_from_slice(a);
         input[64..].copy_from_slice(b);
-        let out = alt_bn128_g1_addition_be(&input)
-            .map_err(|e| Error::SyscallFailed { which: "alt_bn128_g1_add", code: e.into() })?;
-        debug_assert_eq!(out.len(), 64);
-        let mut result = [0u8; 64];
-        result.copy_from_slice(&out);
-        Ok(result)
+
+        #[cfg(feature = "mainnet-le")]
+        let out = {
+            let le_a = swap_g1(a);
+            let le_b = swap_g1(b);
+            let mut le_input = [0u8; 128];
+            le_input[..64].copy_from_slice(&le_a);
+            le_input[64..].copy_from_slice(&le_b);
+            let le_out = alt_bn128_g1_addition_le(&le_input)
+                .map_err(|e| Error::SyscallFailed { which: "alt_bn128_g1_add_le", code: e.into() })?;
+            let mut le_arr = [0u8; 64];
+            le_arr.copy_from_slice(&le_out);
+            swap_g1(&le_arr)
+        };
+        #[cfg(not(feature = "mainnet-le"))]
+        let out = {
+            let raw = alt_bn128_g1_addition_be(&input)
+                .map_err(|e| Error::SyscallFailed { which: "alt_bn128_g1_add", code: e.into() })?;
+            debug_assert_eq!(raw.len(), 64);
+            let mut result = [0u8; 64];
+            result.copy_from_slice(&raw);
+            result
+        };
+        Ok(out)
     }
 
     pub fn g1_mul(p: &[u8; 64], scalar_be: &[u8; 32]) -> Result<[u8; 64], Error> {
-        let mut input = [0u8; 96];
-        input[..64].copy_from_slice(p);
-        input[64..].copy_from_slice(scalar_be);
-        let out = alt_bn128_g1_multiplication_be(&input)
-            .map_err(|e| Error::SyscallFailed { which: "alt_bn128_g1_mul", code: e.into() })?;
-        debug_assert_eq!(out.len(), 64);
-        let mut result = [0u8; 64];
-        result.copy_from_slice(&out);
-        Ok(result)
+        #[cfg(feature = "mainnet-le")]
+        let out = {
+            let le_p = swap_g1(p);
+            let le_s = swap_fr(scalar_be);
+            let mut le_input = [0u8; 96];
+            le_input[..64].copy_from_slice(&le_p);
+            le_input[64..].copy_from_slice(&le_s);
+            let le_out = alt_bn128_g1_multiplication_le(&le_input)
+                .map_err(|e| Error::SyscallFailed { which: "alt_bn128_g1_mul_le", code: e.into() })?;
+            let mut le_arr = [0u8; 64];
+            le_arr.copy_from_slice(&le_out);
+            swap_g1(&le_arr)
+        };
+        #[cfg(not(feature = "mainnet-le"))]
+        let out = {
+            let mut input = [0u8; 96];
+            input[..64].copy_from_slice(p);
+            input[64..].copy_from_slice(scalar_be);
+            let raw = alt_bn128_g1_multiplication_be(&input)
+                .map_err(|e| Error::SyscallFailed { which: "alt_bn128_g1_mul", code: e.into() })?;
+            debug_assert_eq!(raw.len(), 64);
+            let mut result = [0u8; 64];
+            result.copy_from_slice(&raw);
+            result
+        };
+        Ok(out)
     }
 
     /// Returns `Ok(true)` iff `Π e(p₁, p₂) = 1`.
@@ -62,11 +156,26 @@ mod onchain {
         if pairs.is_empty() || pairs.len() % 192 != 0 {
             return Err(Error::Protocol("pairing_check: input not a multiple of 192"));
         }
+        #[cfg(feature = "mainnet-le")]
+        let out = {
+            let mut le_pairs = alloc::vec![0u8; pairs.len()];
+            for (i, chunk) in pairs.chunks_exact(192).enumerate() {
+                let base = i * 192;
+                swap_pair_chunk(chunk, &mut le_pairs[base..base + 192]);
+            }
+            alt_bn128_pairing_le(&le_pairs)
+                .map_err(|e| Error::SyscallFailed { which: "alt_bn128_pairing_le", code: e.into() })?
+        };
+        #[cfg(not(feature = "mainnet-le"))]
         let out = alt_bn128_pairing_be(pairs)
             .map_err(|e| Error::SyscallFailed { which: "alt_bn128_pairing", code: e.into() })?;
+
         debug_assert_eq!(out.len(), 32);
-        // BE BigInteger256: success → [0; 31, 1], failure → [0; 32].
-        Ok(out[..31].iter().all(|&b| b == 0) && out[31] == 1)
+        // Output is encoded `BigInteger256(0)` (pairing rejected) or `(1)`
+        // (accepted) — single bit of information either way. Be lenient about
+        // byte position so the same check works for the BE syscall's
+        // `[0;31, 1]` and the LE syscall's `[1, 0;31]`. Any non-zero byte → ok.
+        Ok(out.iter().any(|&b| b != 0))
     }
 
     /// Keccak-256 over `input`. Same syscall on BPF, sha3 emulation on host.
@@ -202,6 +311,88 @@ mod onchain {
     }
     pub fn g2_mul(_p: &[u8; 128], _scalar_be: &[u8; 32]) -> Result<[u8; 128], Error> {
         Err(Error::Protocol("g2_mul: arkworks fallback TODO (needed only for tests)"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A2 — differential BE↔LE sanity tests. These run on the host but exercise
+// the `mainnet-le` cfg branch when that feature is enabled, against an
+// expected value derived via direct arkworks BN254 arithmetic. They assert
+// that the wrapper's bytes-in / bytes-out interface is endian-agnostic to
+// the caller (still BE) regardless of which underlying syscall is called.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "std", feature = "solana-syscalls"))]
+mod a2_tests {
+    use super::*;
+    use ark_bn254::{Fr as ArkFr, G1Affine, G1Projective};
+    use ark_ec::{AffineRepr, CurveGroup};
+    use ark_ff::PrimeField;
+    use ark_serialize::{CanonicalSerialize, Compress};
+
+    /// Encode an arkworks affine G1 as 64-byte BE (32 B X || 32 B Y).
+    fn g1_to_be_bytes(p: G1Affine) -> [u8; 64] {
+        if p.is_zero() { return [0u8; 64]; }
+        let mut le = [0u8; 64];
+        p.x.serialize_with_mode(&mut le[..32], Compress::No).unwrap();
+        p.y.serialize_with_mode(&mut le[32..], Compress::No).unwrap();
+        // ark serializes LE → flip each 32-B chunk to BE.
+        let mut be = [0u8; 64];
+        for c in 0..2 {
+            for i in 0..32 {
+                be[c * 32 + i] = le[c * 32 + (31 - i)];
+            }
+        }
+        be
+    }
+
+    fn fr_to_be_bytes(s: ArkFr) -> [u8; 32] {
+        let mut le_buf = [0u8; 32];
+        s.serialize_with_mode(&mut le_buf[..], Compress::No).unwrap();
+        let mut be = [0u8; 32];
+        for i in 0..32 { be[i] = le_buf[31 - i]; }
+        be
+    }
+
+    /// G1 add via our wrapper must equal arkworks `(p + q)` regardless of
+    /// whether the BE or LE syscall variant is the one wired in.
+    #[test]
+    fn g1_add_matches_arkworks() {
+        let g = G1Affine::generator();
+        let scalar_p = ArkFr::from(7u64);
+        let scalar_q = ArkFr::from(11u64);
+        let p_proj: G1Projective = G1Affine::generator() * scalar_p;
+        let q_proj: G1Projective = G1Affine::generator() * scalar_q;
+        let p_aff = p_proj.into_affine();
+        let q_aff = q_proj.into_affine();
+        let expected_aff: G1Affine = (p_proj + q_proj).into_affine();
+
+        let p_be = g1_to_be_bytes(p_aff);
+        let q_be = g1_to_be_bytes(q_aff);
+        let expected_be = g1_to_be_bytes(expected_aff);
+
+        let got = onchain::g1_add(&p_be, &q_be).unwrap();
+        assert_eq!(got, expected_be, "g1_add bytes-out mismatch (feature: mainnet-le={})",
+            cfg!(feature = "mainnet-le"));
+
+        // Touch `g` so the binding actually runs.
+        let _ = g;
+    }
+
+    /// G1 scalar-mul via our wrapper must equal arkworks `s · p`.
+    #[test]
+    fn g1_mul_matches_arkworks() {
+        let scalar = ArkFr::from(0xDEAD_BEEFu64);
+        let p_proj: G1Projective = G1Affine::generator() * ArkFr::from(13u64);
+        let p_aff = p_proj.into_affine();
+        let expected_aff: G1Affine = (p_proj * scalar).into_affine();
+
+        let p_be = g1_to_be_bytes(p_aff);
+        let s_be = fr_to_be_bytes(scalar);
+        let expected_be = g1_to_be_bytes(expected_aff);
+
+        let got = onchain::g1_mul(&p_be, &s_be).unwrap();
+        assert_eq!(got, expected_be, "g1_mul bytes-out mismatch (feature: mainnet-le={})",
+            cfg!(feature = "mainnet-le"));
     }
 }
 

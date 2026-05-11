@@ -67,17 +67,55 @@ pub fn read_proof(
 
     let mut cur = 0usize;
 
-    // (1) advice commits ───────────────────────────────────────────────────
-    let advice_commits = read_g1s(transcript, proof_bytes, &mut cur, vk.num_advice)?;
-
-    // (1.5) v2.0: user-defined phase challenges. Halo2 squeezes one challenge
-    // per `cs.num_challenges()` AFTER the matching phase's advice commits and
-    // BEFORE theta. v1.5 collapsed all advice into one batch (single-phase
-    // assumption) — we keep that here, so all user challenges are squeezed in
-    // one block. Multi-phase splitting is task #46.
-    let mut user_challenges = Vec::with_capacity(vk.num_challenges);
-    for _ in 0..vk.num_challenges {
-        user_challenges.push(transcript.squeeze_challenge());
+    // (1) advice commits + (1.5) user challenges, **phase-interleaved**
+    // (v2.1). For each phase p:
+    //   1. read the G1 advice commit for every column with
+    //      `vk.advice_column_phase[c] == p` (in column-index order, mirroring
+    //      halo2's `ConstraintSystem::advice_column_phase` iteration);
+    //   2. squeeze every user challenge with `vk.challenge_phase[i] == p`.
+    // Single-phase circuits (`vk.num_phases == 1`) collapse to the v2.0
+    // behaviour: all advice in one batch, then all challenges, then theta.
+    //
+    // **Storage**: `advice_commits[c]` is indexed by column number (not read
+    // order). Same for `user_challenges[i]` — index matches the OP_CHALLENGE
+    // opcode argument in gate ASTs.
+    let mut advice_commits = alloc::vec![crate::curve::G1([0u8; 64]); vk.num_advice];
+    let mut user_challenges = alloc::vec![Fr::from(0u64); vk.num_challenges];
+    {
+        // Single-phase legacy callers (and test fixtures) may leave the
+        // phase Vecs empty; treat that as "everything in phase 0".
+        let single_phase_legacy =
+            vk.num_phases <= 1
+                && vk.advice_column_phase.is_empty()
+                && vk.challenge_phase.is_empty();
+        if single_phase_legacy {
+            for c in 0..vk.num_advice {
+                advice_commits[c] = transcript.read_g1(proof_bytes, &mut cur)?;
+            }
+            for i in 0..vk.num_challenges {
+                user_challenges[i] = transcript.squeeze_challenge();
+            }
+        } else {
+            // Multi-phase (or single-phase-with-explicit-tables) path.
+            if vk.advice_column_phase.len() != vk.num_advice {
+                return Err(Error::Protocol("read_proof: advice_column_phase length mismatch"));
+            }
+            if vk.challenge_phase.len() != vk.num_challenges {
+                return Err(Error::Protocol("read_proof: challenge_phase length mismatch"));
+            }
+            for p in 0..vk.num_phases {
+                for (c, &col_phase) in vk.advice_column_phase.iter().enumerate() {
+                    if col_phase == p {
+                        advice_commits[c] = transcript.read_g1(proof_bytes, &mut cur)?;
+                    }
+                }
+                for (i, &ch_phase) in vk.challenge_phase.iter().enumerate() {
+                    if ch_phase == p {
+                        user_challenges[i] = transcript.squeeze_challenge();
+                    }
+                }
+            }
+        }
     }
 
     // squeeze theta ────────────────────────────────────────────────────────
@@ -252,8 +290,28 @@ pub fn parse_proof_no_fs(
 ) -> Result<PlonkProof, Error> {
     let mut cur = 0usize;
 
-    // (1) advice commits
-    let advice_commits = read_g1s_no_fs(proof_bytes, &mut cur, vk.num_advice)?;
+    // (1) advice commits — phase-interleaved on the wire. We store at the
+    // column index so downstream `build_queries` can index by `col` unchanged.
+    // No FS squeezes here (caller has replay-bound the proof bytes already).
+    let single_phase_legacy =
+        vk.num_phases <= 1 && vk.advice_column_phase.is_empty();
+    let mut advice_commits = alloc::vec![crate::curve::G1([0u8; 64]); vk.num_advice];
+    if single_phase_legacy {
+        for c in 0..vk.num_advice {
+            advice_commits[c] = read_g1_no_fs(proof_bytes, &mut cur)?;
+        }
+    } else {
+        if vk.advice_column_phase.len() != vk.num_advice {
+            return Err(Error::Protocol("parse_proof_no_fs: advice_column_phase length mismatch"));
+        }
+        for p in 0..vk.num_phases {
+            for (c, &col_phase) in vk.advice_column_phase.iter().enumerate() {
+                if col_phase == p {
+                    advice_commits[c] = read_g1_no_fs(proof_bytes, &mut cur)?;
+                }
+            }
+        }
+    }
 
     // (1.6) per-lookup permuted_input + permuted_table commits
     let mut lookup_permuted_input_commits = Vec::with_capacity(vk.num_lookups());

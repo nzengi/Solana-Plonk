@@ -117,63 +117,113 @@ produced by the bit-flip, propagated back to the verifier as
 
 ## Mollusk per-circuit numbers
 
-Same `.so`, every circuit. `request_heap_frame(256_000)` to match
-on-chain.
+Same `.so`, every circuit, `request_heap_frame(256_000)` to match
+on-chain. Two columns: **1-tx total** and the per-stage breakdown for
+the **3-tx split path** introduced in v2.1.
 
-| Circuit | Mollusk CU | Fits 1.4 M cap? |
-|---|---:|:---:|
-| StandardPlonk | 2,728,844 | no |
-| Fibonacci | 2,284,029 | no |
-| Multi-lookup (2 Plookup args) | 2,286,887 | no |
-| Range-check (1 Plookup arg) | 1,692,408 | no |
-| Shuffle | 1,374,962 | **yes** |
+| Circuit | 1-tx CU | STAGE1 | STAGE2A | STAGE3 | 3-tx total | Fits 1.4 M cap? |
+|---|---:|---:|---:|---:|---:|---|
+| Shuffle | 1,123,442 | 804,457 | 437,861 | 167,664 | 1,409,982 | **1-tx ✓** |
+| Range-check (1 Plookup) | 1,294,206 | 859,779 | 572,025 | 197,476 | 1,629,280 | **1-tx ✓** |
+| Multi-lookup (2 Plookup) | 1,508,493 | 954,831 | 733,579 | 271,956 | 1,960,366 | 3-tx ✓ |
+| Bound-range-check | 1,609,953 | 1,089,730 | 696,767 | 257,048 | 2,043,545 | 3-tx ✓ |
+| Fibonacci | 1,653,156 | 1,045,418 | 792,662 | 227,216 | 2,065,296 | 3-tx ✓ |
+| StandardPlonk | 1,672,427 | 1,008,011 | 871,570 | 331,668 | 2,211,249 | 3-tx ✓ |
 
-The SIMD-bound aborts kept around as the negative case:
+**Every reference circuit fits the 1.4 M cap end-to-end via the 3-tx
+flow.** The largest single stage is StandardPlonk STAGE1 at 1.008 M
+(392 k slack). Shuffle and range-check additionally fit in a single
+tx after Path B (Montgomery batched inverse + cached Lagrange basis
+in `kzg::shplonk`) — no split required for those circuits today.
 
-| Tx | Circuit | CU |
-|---|---|---:|
-| [`2gMQXTfC…BDWo`](https://explorer.solana.com/tx/2gMQXTfCfdAnyRnqVz7zzoTaWzzNi5XdktZi9vjWe9sT9GcHTN2tXBYt8E1QHvdrbqrDKTQBwiRVgMJ7TYxoBDWo?cluster=devnet) | range-check (Plookup), 1-tx attempt | 1,399,644 |
-| [`3r1ZSg3D…XUje5`](https://explorer.solana.com/tx/3r1ZSg3DX6JhWp3zupEqqUptyz8GGpFekoqkjfyepBZySDCScMo5DAZYtwHpAM6cFw2Zajfchw7K7hho6YGXUje5?cluster=devnet) | StandardPlonk (v1), 1-tx attempt | 1,399,644 |
+These numbers reflect a v2.1 binary (program ID still
+`KvBa8qgb…SK8N`). The pre-Path-B / pre-3-tx numbers are kept on chain
+as historical artifacts (see "SIMD-bound aborts" below) — they
+correspond to the v2.0 binary that was running before the latest
+upgrade tx
+[`5BCm5Doftr…SJhqC`](https://explorer.solana.com/tx/5BCm5DoftrgFk8QPFQCwPvcV2x5xLXv4gZc5XbSFRfrE2SXRfpNyMTdSRzoKF3eThDRcNDZ6arz2NoTd82dSJhqC?cluster=devnet).
 
-Even with the 2-tx split, three of our reference circuits still
-overshoot stage 2's 1.4 M cap because their SHPLONK slice alone is
-between 1.18 M and 1.67 M. The pattern is consistent — stage 1 fits
-for every circuit, stage 2 only fits for range-check (Plookup):
+### Pre-Path-B aborts (historical, v2.0 binary)
 
-| Circuit | stage 1 tx | stage 2 tx | stage 2 CU |
-|---|---|---|---:|
-| Fibonacci | [`4m1ERjQy…tpGK`](https://explorer.solana.com/tx/4m1ERjQyGRqTogvGFfWi5rMEXsFgG9Vb9RtMAdPbkSaeb2qtYeBXRkbLtFBftUWwZ8vpGC2f4WEykNhEgSMVtpGK?cluster=devnet) Ok 1,045,360 | [`5yc9VpEr…rJFx`](https://explorer.solana.com/tx/5yc9VpErguYcJUQVptD7PUNytgF6yVJt8QQJbh86b8BGnVfKX4xKqrcVYuhkRkWN4bDYqBpoMQC8oZZ9gjb7rJFx?cluster=devnet) failed | 1,399,644 |
-| Multi-lookup (2 Plookup) | [`3KnYHnHh…75oe`](https://explorer.solana.com/tx/3KnYHnHhRN9uhHWs9pNj5atxvKYSv4bLyhYYD2CYKGUFp4hVmPwxc3R8KhhuR1C1seRCpD2mSuxcMNGYmKGa75oe?cluster=devnet) Ok 954,773 | [`4ZkvgNGx…vJkd`](https://explorer.solana.com/tx/4ZkvgNGxhdsnnqNHbs2uNfmZ3HmzMtnuBRD7ykZaavp4yZTpgiKQJVnew5h9Kcq8yCsDrkiqiMrw7E93r49dvJkd?cluster=devnet) failed | 1,399,644 |
+The original 1-tx attempts for the larger circuits exhausted the 1.4 M
+cap mid-SHPLONK. They're preserved here as negative evidence and to
+date the cost reduction:
 
-These stage 1 successes are not just curiosities — they prove the
-2-tx framework correctly checkpoints and replay-binds *any* halo2
-circuit regardless of stage 2 fit. A 3-tx split or a Layer 2 SIMD
-(`alt_bn128_g1_msm`) closes the remaining gap; design notes in
-[`docs/2_tx_split.md`](2_tx_split.md).
+| Tx | Circuit | CU | Status |
+|---|---|---:|---|
+| [`2gMQXTfC…BDWo`](https://explorer.solana.com/tx/2gMQXTfCfdAnyRnqVz7zzoTaWzzNi5XdktZi9vjWe9sT9GcHTN2tXBYt8E1QHvdrbqrDKTQBwiRVgMJ7TYxoBDWo?cluster=devnet) | range-check (Plookup), 1-tx pre-Path-B | 1,399,644 | cap exhausted (now fits at 1.29 M) |
+| [`3r1ZSg3D…XUje5`](https://explorer.solana.com/tx/3r1ZSg3DX6JhWp3zupEqqUptyz8GGpFekoqkjfyepBZySDCScMo5DAZYtwHpAM6cFw2Zajfchw7K7hho6YGXUje5?cluster=devnet) | StandardPlonk (v1), 1-tx pre-Path-B | 1,399,644 | cap exhausted (now 1.67 M, fits 3-tx) |
+| [`5yc9VpEr…rJFx`](https://explorer.solana.com/tx/5yc9VpErguYcJUQVptD7PUNytgF6yVJt8QQJbh86b8BGnVfKX4xKqrcVYuhkRkWN4bDYqBpoMQC8oZZ9gjb7rJFx?cluster=devnet) | Fibonacci, 2-tx **stage 2** pre-Path-B | 1,399,644 | cap exhausted (now fits 3-tx with stage 2a=793 k + stage 3=227 k) |
+| [`4ZkvgNGx…vJkd`](https://explorer.solana.com/tx/4ZkvgNGxhdsnnqNHbs2uNfmZ3HmzMtnuBRD7ykZaavp4yZTpgiKQJVnew5h9Kcq8yCsDrkiqiMrw7E93r49dvJkd?cluster=devnet) | Multi-lookup, 2-tx stage 2 pre-Path-B | 1,399,644 | cap exhausted (now fits 3-tx) |
+
+These prove the cost reduction is real and on-chain visible:
+range-check 1.69 M → 1.29 M = −23 %, Fibonacci 2.28 M → 1.65 M = −28 %,
+StandardPlonk 2.71 M → 1.67 M = −39 %. The full table is in
+[`README.md`](../README.md#numbers).
 
 ## Per-stage CU profile
 
-`stage-trace` cargo feature emits `sol_log_compute_units_` between
-every verifier stage.
+Two views — the legacy `stage-trace` feature breakdown for the 1-tx
+flow, and the per-tx Mollusk readouts for the 3-tx flow.
 
-Range-check (k=6, 4-bit Plookup):
+### 1-tx flow (range-check, post-Path-B)
 
-| Stage | CU | % |
-|---|---:|---:|
-| `parse_vk` | 11,089 | <1 |
-| `read_proof` | 149,334 | 9 |
-| `lagrange::evaluate_lagrange` | 542,854 | 32 |
-| `compute_expected_h_eval` | 95,975 | 6 |
-| `aggregate_h_commitment` | 23,600 | 1 |
-| `omega_last` | 19,248 | 1 |
-| `build_queries` | 35,771 | 2 |
-| `shplonk::verify_opening` | 764,412 | 45 |
-| `alt_bn128_pairing` | 49,546 | 3 |
-| **total** | **1,692,387** | 100 |
+Captured via the `stage-trace` cargo feature, which emits
+`sol_log_compute_units_` between every verifier stage. The numbers
+below reflect the Path B refactor (`shplonk::build_shplonk_msm_terms`
+runs phase 1 with Montgomery batched inverse + cached Lagrange basis,
+which is what dropped `shplonk::verify_opening` from 764 k to ~370 k
+CU on this circuit).
 
-77 % of cost lives in two stages: `shplonk::verify_opening` (G1 MSM)
-and `lagrange::evaluate_lagrange` (Fr inverses). Both have SIMD drafts
-in `docs/simd-proposals/`.
+| Stage | CU (post-Path-B, range-check) | Notes |
+|---|---:|---|
+| `parse_vk` | ~11 k | unchanged |
+| `read_proof` | ~149 k | unchanged |
+| `lagrange::evaluate_lagrange` | ~542 k | unchanged (top-level Lagrange not in the batched-inverse path yet) |
+| `compute_expected_h_eval` | ~96 k | unchanged |
+| `aggregate_h_commitment` | ~24 k | unchanged |
+| `omega_last` | ~19 k | unchanged |
+| `build_queries` | ~36 k | unchanged |
+| `shplonk::verify_opening` | **~370 k** | **−394 k vs pre-Path-B** (was 764 k) |
+| `alt_bn128_pairing` | ~50 k | unchanged |
+| **total** | **~1,294 k** | down from ~1,692 k, fits 1.4 M cap |
+
+The Path B win is concentrated in `shplonk::verify_opening`'s
+rotation-set inner loop, where the legacy code called `lagrange_interpolate`
+once per commitment with N Fermat inverses internally. The new
+`build_shplonk_msm_terms` does ONE Fermat inverse + 3(N−1) Fr muls
+across all rotation sets via Montgomery's trick. Cached numerator
+polynomials remove the rebuild cost too.
+
+### 3-tx flow (Fibonacci, devnet on-chain)
+
+Per-tx Mollusk vs on-chain — match to within 56 CU per stage:
+
+| Stage | Mollusk | On-chain | Δ |
+|---|---:|---:|---:|
+| STAGE1   | 1,045,418 | 1,045,362 | 56 |
+| STAGE2A  |   792,662 |   792,606 | 56 |
+| STAGE3   |   227,216 |   227,160 | 56 |
+| total    | 2,065,296 | 2,065,128 | 168 |
+
+The 168-CU constant gap is tx-dispatch + heap-frame initialization
+overhead. No algorithmic drift between emulation and real BPF VM.
+
+What runs in each stage:
+
+- **STAGE1**: `parse_vk + read_proof + lagrange::evaluate_lagrange +
+  compute_expected_h_eval + aggregate_h_commitment + omega_last` →
+  writes `Stage1Output` PDA (4 KB).
+- **STAGE2A**: reads `Stage1Output`, runs `parse_proof_no_fs +
+  build_queries + shplonk::build_shplonk_msm_terms` (Path B phase 1,
+  Fr-only) → writes `Stage2Output` PDA (8 KB).
+- **STAGE3**: reads `Stage2Output`, runs
+  `shplonk::finalize_shplonk_pairs` (single G1 MSM via
+  `alt_bn128_g1_multiplication_be` × N) + `alt_bn128_pairing`. **No
+  data-account access** — the kzg-vk G2 fields are persisted inside
+  Stage2Output, so soundness depends only on the program ownership
+  of the PDAs + the three replay-binding keccak hashes carried
+  forward from STAGE1.
 
 ## Soundness audit (host-side shadow)
 
@@ -207,22 +257,18 @@ cargo run -p multi-lookup-check-circuit  --bin gen-ml-proof  -- --shadow-audit
 
 ## Test coverage
 
-`cargo test --workspace` reports 101 / 101 at HEAD.
+`cargo test --workspace` reports **152 / 152** at HEAD.
 
-| Crate / test surface | Tests |
-|---|---:|
-| `halo2-solana-verifier` (verifier crate, with `solana-syscalls`) | 83 |
-| `halo2-solana-vk-host` | 6 |
-| `g1-msm-ref` (Pippenger reference) | 11 |
-| `fr-batch-inv-ref` (Montgomery batch inverse reference) | 7 |
-| `halo2-solana-verifier-program` | lib + 6 BPF VM integration tests |
+| Surface | What's covered |
+|---|---|
+| `halo2-solana-verifier` (lib) | gate RPN evaluator, Lagrange basis math, permutation expressions, lookup + shuffle expressions, SHPLONK rotation-set construction (incl. pointer-eq-vs-byte-eq trap that bit v1), expected-h-eval Horner fold, proof-reader wire layout, VK byte format, **Path B batched-inverse bit-equivalence with legacy `lagrange_interpolate`**, **`Stage2Output` byte format + replay binding (Stage1Output + Stage2Output across stages)**, **BE↔LE syscall differential against arkworks** (`a2_tests::g1_add_matches_arkworks`, `g1_mul_matches_arkworks`), **multi-phase VK appendix parser (3 reject cases + 1 accept)**. |
+| `halo2-solana-vk-host` | VK roundtrip for every supported circuit shape (single + multi-phase). |
+| `g1-msm-ref` (Pippenger reference) | 11 tests — oracle for the G1 MSM SIMD. |
+| `fr-batch-inv-ref` (Montgomery reference) | 7 tests — independent reference for the Path B batched-inverse algorithm. |
+| `halo2-solana-verifier-program` | Lib + Mollusk BPF VM integration: every circuit verifies 1-tx; full 3-tx flow for every circuit in `cu_bench_3tx_all.rs` (each stage asserted under 1.4 M cap); 3-tx host-side replay-protection tests (wrong payer / wrong nonce / data-account tampering between stages). |
 
-The verifier crate's tests cover: gate RPN evaluator, lagrange basis
-math, permutation expressions, lookup expressions, shuffle
-expressions, SHPLONK rotation-set construction (including the
-pointer-eq-vs-byte-eq trap that bit v1), expected-h-eval Horner fold,
-proof-reader wire layout, VK byte format. The BPF VM integration
-tests run every test circuit's verify-tx through Mollusk.
+Each non-trivial circuit additionally ships a `shadow.rs` host-side
+audit (`--shadow-audit` flag) — see the next section.
 
 ## Working application — ZK-gated reward pool
 
@@ -326,19 +372,38 @@ Every devnet tx replayable: `solana confirm -v <SIG> -u devnet`.
 
 ## Honest caveats
 
-The verifier supports lookup, shuffle, and single-phase user
-challenges. It does not yet support:
+What the verifier supports today (after Tier A): lookup, shuffle,
+single-phase user challenges, **multi-phase circuits**, in-gate
+`Expression::Instance` queries, 2-tx split (range-check on devnet),
+**3-tx split** (Fibonacci on devnet, every reference circuit fits in
+Mollusk).
 
-- multi-phase circuits (vk-host hard-rejects)
-- 2-tx split for circuits that don't fit one tx
-- LE byte format (mainnet active per SIMD-0284 — repo is BE-first)
-- free-able allocator (the Pinocchio bump allocator caps practical
-  circuit size)
+What still doesn't quite work:
 
-The Layer 2 + Layer 3 SIMD drafts in `docs/simd-proposals/` lay out a
-path to bring every reference circuit under 1.4 M with margin. Both
-drafts ship reference implementations and Mollusk bench grids; neither
-has been filed as a formal SIMD-XXXX PR yet.
+- **End-to-end LE syscall path** — the `mainnet-le` Cargo feature
+  routes `alt_bn128_*_be` → `alt_bn128_*_le` and ships an arkworks
+  differential test that passes for both endianness modes. But the
+  `_le` op-codes are unrecognized by `agave-syscalls 3.1.14` (the
+  runtime Mollusk pins), so the end-to-end Mollusk test for the LE
+  path returns `InvalidAttribute` at ~761 k CU. **Runtime gap, not
+  a verifier bug** — the wrappers go live the moment SIMD-0284 LE
+  op-codes land in mainnet-aligned agave.
+- **Free-able allocator** — Pinocchio's bump allocator never frees,
+  so circuits beyond a certain size eventually exhaust the 256 KB
+  heap. Linked-list allocator is in the roadmap.
+- **halo2-lib chip-library circuits** — would now compile through
+  vk-host (multi-phase no longer rejected) but the chip wiring is
+  large; not part of the current compat test corpus. See
+  [`docs/compatibility.md`](compatibility.md) for the open gap list.
+- **Log-derivative lookups (LogUp)** — modern halo2-lib uses these
+  instead of Plookup; verifier currently only handles Plookup.
+
+The Layer 2 + Layer 3 SIMD drafts in `docs/simd-proposals/` remain
+useful — the Path B refactor in software captured most of the Layer
+3 (Fr-batch-inverse) win without a syscall, but a native syscall
+would still save ~400 k CU on top. The Layer 2 (G1 MSM) syscall is
+still worth ~15-20 % total verify CU after Path B. Neither has been
+filed as a formal SIMD-XXXX PR yet.
 
 ## Repo
 

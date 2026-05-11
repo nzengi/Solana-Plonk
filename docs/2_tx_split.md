@@ -1,12 +1,28 @@
 # 2-tx Split — Design Note
 
-The verifier ships with a 2-tx split path that lets circuits whose
-single-tx total CU exceeds Solana's 1.4 M per-tx cap still verify
-end-to-end on devnet today, no SIMD landing required.
+> **Status note (v2.1):** the 2-tx split documented below is the
+> **historical predecessor** of the current 3-tx split. The 2-tx flow
+> still works (range-check on devnet) and the on-chain
+> [`STAGE1_TAG = 0x02`](../programs/verifier-program/src/lib.rs) /
+> `STAGE2_TAG = 0x03` instruction tags remain wired in the .so. But
+> after the Path B refactor (Montgomery batched inverse + cached
+> Lagrange basis in `kzg::shplonk`) and the 3-tx split shipping in
+> v2.1, the production path for larger circuits is now **3-tx**
+> (`STAGE1 → STAGE2A → STAGE3`, tags `0x02 / 0x04 / 0x05`) — see
+> [`EVIDENCE.md`](EVIDENCE.md) for the Fibonacci 3-tx devnet evidence
+> and [`README.md`](../README.md#numbers) for the post-Path-B CU
+> table. Two paths matter going forward: 1-tx for small circuits
+> (shuffle, range-check post-Path-B both fit in a single tx), and
+> 3-tx for everything else.
 
-This document covers what the split is, the byte format passed
+The verifier originally shipped with a 2-tx split path so circuits
+whose single-tx total CU exceeded Solana's 1.4 M per-tx cap could
+still verify end-to-end on devnet, no SIMD landing required.
+
+This document covers what the 2-tx split is, the byte format passed
 between the two transactions, the replay-protection mechanism, and
-which circuits actually fit (and which still don't).
+which circuits actually fit (and which now have a better fit via
+3-tx instead).
 
 ## What gets split where
 

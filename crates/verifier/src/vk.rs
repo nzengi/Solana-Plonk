@@ -67,6 +67,11 @@
 //!     <input bytecodes>
 //!     num_shuffle_expressions : u32 LE   // must equal num_input_expressions
 //!     <shuffle bytecodes>
+//!
+//! ---- v2.1 multi-phase appendix (OPTIONAL — absent ⇒ single-phase) ----
+//! num_phases               : u8
+//! advice_column_phase[]    : u8 × num_advice
+//! challenge_phase[]        : u8 × num_challenges
 //! ```
 //!
 //! See `halo2-solana-vk-host::compile::compile_vk` for the matching encoder.
@@ -197,6 +202,47 @@ pub fn parse_vk(bytes: &[u8]) -> Result<PlonkProtocol, Error> {
         shuffles.push(ShuffleArgument { input_expressions, shuffle_expressions });
     }
 
+    // ── v2.1: optional multi-phase appendix ──────────────────────────────
+    // Backward-compatible: if no bytes remain, default to single-phase
+    // (all advice columns + challenges in phase 0). If bytes remain, they
+    // MUST form a valid multi-phase block — invariants:
+    //   - num_phases ≥ 2 (single-phase circuits must omit the appendix)
+    //   - num_advice + num_challenges > 0 (appendix carries data only when
+    //     there's at least one column or challenge to phase-tag)
+    //   - every advice/challenge phase index is in `[0, num_phases)`
+    //   - at least one advice or challenge uses a phase > 0 (else the
+    //     appendix is degenerate and should have been omitted)
+    let (num_phases, advice_column_phase, challenge_phase) = if r.is_empty() {
+        (1u8, alloc::vec![0u8; num_advice], alloc::vec![0u8; num_challenges])
+    } else {
+        if num_advice == 0 && num_challenges == 0 {
+            return Err(Error::InvalidVkEncoding);
+        }
+        let num_phases = r.read_array::<1>()?[0];
+        if num_phases < 2 {
+            return Err(Error::InvalidVkEncoding);
+        }
+        let mut acp = Vec::with_capacity(num_advice);
+        for _ in 0..num_advice {
+            let p = r.read_array::<1>()?[0];
+            if p >= num_phases { return Err(Error::InvalidVkEncoding); }
+            acp.push(p);
+        }
+        let mut cp = Vec::with_capacity(num_challenges);
+        for _ in 0..num_challenges {
+            let p = r.read_array::<1>()?[0];
+            if p >= num_phases { return Err(Error::InvalidVkEncoding); }
+            cp.push(p);
+        }
+        // Reject all-zero tables: those represent single-phase and should
+        // have been encoded with the appendix omitted entirely.
+        let any_nonzero = acp.iter().any(|&p| p != 0) || cp.iter().any(|&p| p != 0);
+        if !any_nonzero {
+            return Err(Error::InvalidVkEncoding);
+        }
+        (num_phases, acp, cp)
+    };
+
     if !r.is_empty() {
         return Err(Error::InvalidVkEncoding);
     }
@@ -223,6 +269,9 @@ pub fn parse_vk(bytes: &[u8]) -> Result<PlonkProtocol, Error> {
         permuted_columns,
         lookups,
         shuffles,
+        num_phases,
+        advice_column_phase,
+        challenge_phase,
         transcript_repr,
     })
 }

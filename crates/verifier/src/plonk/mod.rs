@@ -70,6 +70,22 @@ pub struct PlonkProtocol {
     /// per shuffle, no permuted-input/table machinery).
     pub shuffles: Vec<ShuffleArgument>,
 
+    // ── v2.1: multi-phase metadata ─────────────────────────────────────────
+    /// Number of distinct phases this circuit uses. `1` for single-phase
+    /// (the default; matches v2.0 legacy circuits). `2+` means advice columns
+    /// and challenges are split across phases — the Fiat–Shamir loop in
+    /// `proof_reader::read_proof` interleaves advice reads and challenge
+    /// squeezes phase by phase.
+    pub num_phases: u8,
+    /// Phase index per advice column. `advice_column_phase[c]` is the phase
+    /// in which column `c`'s advice commit is sent by the prover. Length
+    /// always equals `num_advice`; all entries `0` for single-phase circuits.
+    pub advice_column_phase: Vec<u8>,
+    /// Phase index per user challenge. `challenge_phase[i]` is the phase in
+    /// which challenge `i` is squeezed (after that phase's advice commits
+    /// are read). Length equals `num_challenges`; all `0` for single-phase.
+    pub challenge_phase: Vec<u8>,
+
     /// Pre-computed Blake2b("Halo2-Verify-Key" || …) → `transcript_repr`.
     /// Computed off-chain by the VK compiler so the on-chain verifier never
     /// has to run Blake2b.
@@ -134,6 +150,9 @@ impl Default for PlonkProtocol {
             permuted_columns: Vec::new(),
             lookups: Vec::new(),
             shuffles: Vec::new(),
+            num_phases: 1,
+            advice_column_phase: Vec::new(),
+            challenge_phase: Vec::new(),
             transcript_repr: [0u8; 32],
         }
     }

@@ -17,7 +17,23 @@ extends:
 
 Add a single Solana BPF syscall that computes Σᵢ scalarsᵢ · pointsᵢ over BN254 G1 using a Pippenger-style multi-scalar multiplication (MSM). The new syscall replaces the pattern of calling `alt_bn128_g1_multiplication_be` n times followed by `alt_bn128_g1_addition_be` (n − 1) times, which is the only on-chain MSM strategy available today.
 
-This work is paired with [`halo2-solana-verifier`](https://github.com/nzengi/Solana-Plonk), the first PSE-Halo2 BN254/KZG/SHPLONK verifier deployed to Solana. That verifier's per-tx CU profile motivates the proposal: 62% of its 2,710,424 CU runs through SHPLONK's sequential G1 MSM. A batched MSM syscall is the highest-leverage cure, with directly measurable savings.
+This work is paired with [`halo2-solana-verifier`](https://github.com/nzengi/Solana-Plonk), the first PSE-Halo2 BN254/KZG/SHPLONK verifier deployed to Solana. That verifier's per-tx CU profile motivates the proposal: 62 % of its pre-Path-B 2,710,424 CU ran through SHPLONK's sequential G1 MSM. A batched MSM syscall is the highest-leverage cure for those sequential calls, with directly measurable savings.
+
+> **Status update (v2.1, 2026-05):** the case below predates the
+> v2.1 Path B refactor (Montgomery batch inverse + cached Lagrange
+> basis) and the 3-tx split. After Path B the StandardPlonk total
+> dropped from 2.71 M to 1.67 M CU and every reference circuit fits
+> end-to-end via 3-tx — Fibonacci is live on devnet (see
+> [`docs/EVIDENCE.md`](../EVIDENCE.md)). The G1 MSM is **not**
+> addressed by Path B: it remains N sequential
+> `alt_bn128_g1_multiplication_be` syscalls inside
+> `kzg::shplonk::finalize_shplonk_pairs`. A native MSM syscall is
+> still projected at −15 to −20 % total verify CU. The case is no
+> longer "the verifier cannot fit at all" — it is now "the verifier
+> can fit comfortably via the 3-tx split, but a batched syscall would
+> collapse the larger circuits back into a single tx and amortise
+> per-call dispatch overhead." Motivation numbers below remain the
+> right per-stage analysis of where MSM cost lives in the verifier.
 
 ## Motivation
 

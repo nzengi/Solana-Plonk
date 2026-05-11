@@ -52,23 +52,19 @@ pub fn compile_vk(
     let cs = vk.cs();
 
     // ── reject unsupported features early ────────────────────────────────
-    // v2.0: lookups + shuffles are now encoded below.
-    // v2.0 Fiat–Shamir wire is single-phase: all advice commits are read
-    // in one batch, then all user challenges squeezed in one batch, then
-    // theta. Multi-phase circuits interleave advice reads with phase
-    // challenge squeezes — the wire layout differs and is deferred to v2.1.
-    let phases = cs.advice_column_phase();
-    if phases.iter().any(|&p| p != 0) {
-        return Err(Error::Compile(
-            "v2.0 supports single-phase circuits only — multi-phase advice columns deferred to v2.1",
-        ));
-    }
-    let challenge_phases = cs.challenge_phase();
-    if challenge_phases.iter().any(|&p| p != 0) {
-        return Err(Error::Compile(
-            "v2.0 supports single-phase challenges only — multi-phase challenges deferred to v2.1",
-        ));
-    }
+    // v2.1: multi-phase advice/challenge metadata is now encoded as an
+    // optional appendix at the end of the VK byte stream. The Fiat–Shamir
+    // loop in the on-chain `proof_reader::read_proof` re-derives the
+    // per-phase advice-read / challenge-squeeze interleaving from these
+    // tables. Phases are 0-indexed; `cs.advice_column_phase()` and
+    // `cs.challenge_phase()` are the source of truth (PSE halo2 v0.3).
+    let advice_column_phase: Vec<u8> = cs.advice_column_phase();
+    let challenge_phase:     Vec<u8> = cs.challenge_phase();
+    let num_phases: u8 = {
+        let m_a = advice_column_phase.iter().copied().max().unwrap_or(0);
+        let m_c = challenge_phase.iter().copied().max().unwrap_or(0);
+        m_a.max(m_c).saturating_add(1)
+    };
 
     let num_instance         = cs.num_instance_columns();
     let num_advice           = cs.num_advice_columns();
@@ -252,6 +248,16 @@ pub fn compile_vk(
             out.extend_from_slice(&(bc.len() as u32).to_le_bytes());
             out.extend_from_slice(bc);
         }
+    }
+
+    // v2.1 multi-phase appendix — written ONLY when the circuit actually
+    // uses multiple phases. Single-phase circuits omit the appendix so
+    // existing v2.0 goldens stay byte-identical (the verifier defaults to
+    // single-phase when the appendix is absent).
+    if num_phases > 1 {
+        out.push(num_phases);
+        out.extend_from_slice(&advice_column_phase);
+        out.extend_from_slice(&challenge_phase);
     }
 
     Ok(out)

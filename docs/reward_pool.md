@@ -8,6 +8,19 @@ The hot path is one tx: `reward-pool::CLAIM` does a CPI into
 `verifier-program::STAGE2`, gets back a Solana `Ok`, and atomically
 transfers the locked SOL to the claimer.
 
+> **Status note (v2.1):** the on-chain CLAIM flow documented here
+> uses the **2-tx** verifier path (CPI's into `verifier::STAGE2`
+> after the claimer pre-runs `STAGE1`). It still works on devnet
+> (the headline CLAIM tx
+> [`2EbQHB17…ME47`](https://explorer.solana.com/tx/2EbQHB17RVvYsVqBKbmA5c3kSUovrGXZzUo6iLcqU2r4wV8R8kdAFvLeyHj2Heg2Abub6FbAzqDZEFnZLeqBME47?cluster=devnet)
+> ran at 1.06 M CU end-to-end). After the v2.1 Path B refactor
+> (`docs/cu_profile.md`) the 1-tx verifier flow shrank to 1.29 M CU
+> for range-check; the same CLAIM design will work on top of the
+> v2.1 3-tx split too, just with a STAGE3 CPI instead of STAGE2.
+> No reward-pool source changes are required — the CPI target name
+> is the only thing that needs to flip when the demo is rebuilt
+> against the v2.1 binary.
+
 ## Why this demo
 
 The verifier on its own only answers `accept / reject`. Most of the
