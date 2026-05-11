@@ -1,0 +1,30 @@
+[package]
+name        = "external-sp-circuit"
+version     = "0.1.0"
+description = "External compat test: snark-verifier's StandardPlonk variant (1 instance column, gate references Expression::Instance)"
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gen-external-sp"
+path = "src/bin/gen_external_sp.rs"
+
+[lib]
+name = "external_sp_circuit"
+path = "src/lib.rs"
+
+[dependencies]
+halo2_proofs  = { workspace = true }
+halo2curves   = { workspace = true }
+
+ark-bn254     = { workspace = true, features = ["std"] }
+ark-serialize = { workspace = true, features = ["std"] }
+
+halo2-solana-vk-host  = { path = "../../crates/vk-host" }
+halo2-solana-verifier = { path = "../../crates/verifier", features = ["std", "solana-syscalls"] }
+standard-plonk-circuit = { path = "../standard-plonk" }   # reuse Keccak-BE transcript
+
+rand      = "0.8"
+rand_core = "0.6"
+anyhow    = "1"
