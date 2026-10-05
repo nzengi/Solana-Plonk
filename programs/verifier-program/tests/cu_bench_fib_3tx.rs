@@ -188,7 +188,7 @@ fn fibonacci_3tx_split_inside_bpf_vm() {
     let stage3_ix = Instruction {
         program_id,
         accounts: vec![
-            AccountMeta::new_readonly(stage2_pk, false),
+            AccountMeta::new(stage2_pk, false),
             AccountMeta::new_readonly(signer_pk, true),
         ],
         data: stage3_data,
