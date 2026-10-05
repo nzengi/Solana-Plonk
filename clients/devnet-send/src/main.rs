@@ -476,7 +476,10 @@ fn wait_confirmed(client: &RpcClient, sig: &solana_sdk::signature::Signature) ->
         if let Ok(st) = client.get_signature_statuses(&[*sig]) {
             if let Some(Some(s)) = st.value.first() {
                 if let Some(err) = &s.err { anyhow::bail!("tx {sig} failed: {err:?}"); }
-                if s.confirmation_status.is_some() { return Ok(()); }
+                // "processed" is not enough: a confirmed-commitment account read right after
+                // it still returns the pre-transaction state (seen on devnet).
+                let level = s.confirmation_status.as_ref().map(|c| format!("{c:?}")).unwrap_or_default();
+                if level == "Confirmed" || level == "Finalized" { return Ok(()); }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -657,7 +660,13 @@ fn run_three_tx_flow(
     eprintln!("  stage3 : https://explorer.solana.com/tx/{sig3}?cluster=devnet");
     eprintln!();
     // Did stage 3 actually succeed? Read the VerifiedRecord the program leaves in stage2_state.
-    let rec = client.get_account_data(&stage2_state_acct.pubkey())?;
+    // The record appears once the stage-3 write is visible at confirmed commitment; poll briefly.
+    let mut rec = Vec::new();
+    for _ in 0..20 {
+        rec = client.get_account_data(&stage2_state_acct.pubkey())?;
+        if rec.len() >= 8 && &rec[..8] == b"HALO2OK1" { break; }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     let verified = rec.len() >= 8 && &rec[..8] == b"HALO2OK1";
     // proof keccak (what the record and PRUV's attestation bind to): proof bytes live inside the payload.
     let vk_len = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
