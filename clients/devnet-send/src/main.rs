@@ -147,10 +147,15 @@ fn main() -> Result<()> {
         Mode::MultiLookup   => ("../../circuits/multi-lookup-check/tests/golden_v2_ml.bin",
                                 "Multi-lookup (2 Plookup), GLDN0002 → repackaged", true),
     };
-    let mut golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    golden.push(rel_path);
+    let (golden, mode_label, needs_repackage) = match &golden_override {
+        Some(p) => (PathBuf::from(p), "custom GLDN0002 → repackaged", true),
+        None => {
+            let mut g = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            g.push(rel_path);
+            (g, mode_label, needs_repackage)
+        }
+    };
     let raw = std::fs::read(&golden)?;
-
     let mut payload = if needs_repackage {
         repackage_gldn0002_to_gldn0001(&raw)?
     } else {
@@ -403,7 +408,7 @@ fn run_two_tx_flow(
         }
     };
     eprintln!("    submitted: {sig1}");
-    let _ = client.confirm_transaction(&sig1);
+    wait_confirmed(client, &sig1)?;
     eprintln!("    https://explorer.solana.com/tx/{sig1}?cluster=devnet");
 
     // ── STAGE2 tx ──
@@ -435,7 +440,7 @@ fn run_two_tx_flow(
         }
     };
     eprintln!("    submitted: {sig2}");
-    let _ = client.confirm_transaction(&sig2);
+    wait_confirmed(client, &sig2)?;
     eprintln!("    https://explorer.solana.com/tx/{sig2}?cluster=devnet");
 
     eprintln!();
@@ -464,6 +469,21 @@ fn run_two_tx_flow(
 ///   3. STAGE1 tx — writes Stage1Output into stage1_state.
 ///   4. STAGE2A tx — reads stage1_state + data; writes Stage2Output into stage2_state.
 ///   5. STAGE3 tx — reads stage2_state; runs MSM + pairing; no data account.
+/// Poll until the signature is confirmed (or errored) — `confirm_transaction` only
+/// reports the status at call time, which raced the stage-3 record read.
+fn wait_confirmed(client: &RpcClient, sig: &solana_sdk::signature::Signature) -> Result<()> {
+    for _ in 0..120 {
+        if let Ok(st) = client.get_signature_statuses(&[*sig]) {
+            if let Some(Some(s)) = st.value.first() {
+                if let Some(err) = &s.err { anyhow::bail!("tx {sig} failed: {err:?}"); }
+                if s.confirmation_status.is_some() { return Ok(()); }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    anyhow::bail!("tx {sig} not confirmed in time")
+}
+
 fn run_three_tx_flow(
     client:    &RpcClient,
     payer:     &Keypair,
@@ -563,7 +583,7 @@ fn run_three_tx_flow(
         }
     };
     eprintln!("    submitted: {sig1}");
-    let _ = client.confirm_transaction(&sig1);
+    wait_confirmed(client, &sig1)?;
     eprintln!("    https://explorer.solana.com/tx/{sig1}?cluster=devnet");
 
     // ── STAGE2A tx ──
@@ -596,7 +616,7 @@ fn run_three_tx_flow(
         }
     };
     eprintln!("    submitted: {sig2}");
-    let _ = client.confirm_transaction(&sig2);
+    wait_confirmed(client, &sig2)?;
     eprintln!("    https://explorer.solana.com/tx/{sig2}?cluster=devnet");
 
     // ── STAGE3 tx ──
@@ -627,7 +647,7 @@ fn run_three_tx_flow(
         }
     };
     eprintln!("    submitted: {sig3}");
-    let _ = client.confirm_transaction(&sig3);
+    wait_confirmed(client, &sig3)?;
     eprintln!("    https://explorer.solana.com/tx/{sig3}?cluster=devnet");
 
     eprintln!();
