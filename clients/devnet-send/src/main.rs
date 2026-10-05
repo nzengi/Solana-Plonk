@@ -106,8 +106,20 @@ enum Mode {
     MultiLookup,
 }
 
+/// `--<name> <value>` as a string.
+fn parse_str_arg(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
 fn main() -> Result<()> {
-    let program_id: Pubkey = PROGRAM_ID_STR.parse()?;
+    let program_id: Pubkey = parse_str_arg("--program-id").unwrap_or_else(|| PROGRAM_ID_STR.to_string()).parse()?;
+    let rpc_url: String = parse_str_arg("--rpc").unwrap_or_else(|| DEVNET_URL.to_string());
+    let keypair_path: String = parse_str_arg("--keypair").unwrap_or_else(|| {
+        std::env::var("HOME").map(|h| format!("{h}/.config/solana/id.json")).unwrap_or_else(|_| KEYPAIR_PATH.to_string())
+    });
+    // `--golden <path>`: any GLDN0002 blob (e.g. PRUV's code-integrity proof); overrides the mode table.
+    let golden_override = parse_str_arg("--golden");
 
     // Mode selection: `--fib` / `--rc` / `--sh`; default = StandardPlonk.
     let mode = if std::env::args().any(|a| a == "--fib") {
@@ -178,9 +190,9 @@ fn main() -> Result<()> {
     let payload_len = payload.len();
     eprintln!("[1/?] loaded golden vector ({mode_label}): {payload_len} B from {golden:?}");
 
-    let client = RpcClient::new_with_commitment(DEVNET_URL, CommitmentConfig::confirmed());
-    let payer = read_keypair_file(KEYPAIR_PATH)
-        .map_err(|e| anyhow::anyhow!("read keypair: {e}"))?;
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let payer = read_keypair_file(&keypair_path)
+        .map_err(|e| anyhow::anyhow!("read keypair {keypair_path}: {e}"))?;
     eprintln!("[2/?] payer = {}, balance = {} lamports",
         payer.pubkey(),
         client.get_balance(&payer.pubkey())?);
@@ -249,7 +261,7 @@ fn main() -> Result<()> {
     // ── 3-tx split path (--three-tx) ──
     let three_tx_mode = std::env::args().any(|a| a == "--three-tx");
     if three_tx_mode {
-        return run_three_tx_flow(&client, &payer, &program_id, &data_acct.pubkey());
+        return run_three_tx_flow(&client, &payer, &program_id, &data_acct.pubkey(), &payload);
     }
 
     // ── single verify tx (default) ──
@@ -457,6 +469,7 @@ fn run_three_tx_flow(
     payer:     &Keypair,
     program_id: &Pubkey,
     data_acct:  &Pubkey,
+    payload:    &[u8],
 ) -> Result<()> {
     use solana_client::rpc_config::RpcSendTransactionConfig;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -593,7 +606,7 @@ fn run_three_tx_flow(
     let stage3_ix = Instruction {
         program_id: *program_id,
         accounts: vec![
-            AccountMeta::new_readonly(stage2_state_acct.pubkey(), false),
+            AccountMeta::new(stage2_state_acct.pubkey(), false), // VerifiedRecord is written here
             AccountMeta::new(payer.pubkey(), true),
         ],
         data: stage3_data,
@@ -623,6 +636,20 @@ fn run_three_tx_flow(
     eprintln!("  stage2a: https://explorer.solana.com/tx/{sig2}?cluster=devnet");
     eprintln!("  stage3 : https://explorer.solana.com/tx/{sig3}?cluster=devnet");
     eprintln!();
+    // Did stage 3 actually succeed? Read the VerifiedRecord the program leaves in stage2_state.
+    let rec = client.get_account_data(&stage2_state_acct.pubkey())?;
+    let verified = rec.len() >= 8 && &rec[..8] == b"HALO2OK1";
+    // proof keccak (what the record and PRUV's attestation bind to): proof bytes live inside the payload.
+    let vk_len = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+    let proof_start = 8 + 4 + vk_len + 4;
+    let proof_len = u32::from_le_bytes([payload[8 + 4 + vk_len], payload[9 + 4 + vk_len], payload[10 + 4 + vk_len], payload[11 + 4 + vk_len]]) as usize;
+    let proof_keccak = solana_sdk::keccak::hash(&payload[proof_start..proof_start + proof_len]).to_bytes();
+    // Machine-readable summary on stdout (everything else goes to stderr).
+    println!(
+        "{{\"verified\":{},\"verified_record\":\"{}\",\"data_account\":\"{}\",\"proof_keccak\":\"{}\",\"stage1\":\"{}\",\"stage2a\":\"{}\",\"stage3\":\"{}\"}}",
+        verified, stage2_state_acct.pubkey(), data_acct, hex::encode(proof_keccak), sig1, sig2, sig3,
+    );
+    if !verified { anyhow::bail!("stage 3 did not leave a VerifiedRecord (proof rejected or tx failed)"); }
     eprintln!("Per Mollusk profile (Path B batched inverse), every reference");
     eprintln!("circuit's stages fit comfortably under the 1.4 M cap: shuffle");
     eprintln!("(stage1=0.80M / s2a=0.44M / s3=0.17M), Fibonacci (1.05/0.79/0.23),");

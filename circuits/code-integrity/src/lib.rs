@@ -21,19 +21,20 @@ pub use prover::{generate_ci_test_vector, CiTestVector};
 use halo2curves::bn256::Fr;
 use halo2curves::ff::PrimeField;
 
-/// Little-endian bytes → Fr with the top two bits cleared (same as PRUV).
+/// Little-endian bytes → Fr with the top byte cleared: always < 2^248 < r, so the
+/// same value is accepted by the `sol_poseidon` syscall when the attestation
+/// program recomputes the commitment on-chain.
 pub fn field_from_le_bytes(b: &[u8; 32]) -> Fr {
     let mut repr = *b;
-    repr[31] &= 0x3f;
-    Fr::from_repr(repr).unwrap_or(Fr::zero())
+    repr[31] = 0;
+    Fr::from_repr(repr).expect("< 2^248 is always a canonical field element")
 }
 
 /// 16 bytes of a hash → Fr (little-endian, zero-padded).
 pub fn field_from_le_bytes_half(hash: &[u8; 32], range: std::ops::Range<usize>) -> Fr {
     let mut buf = [0u8; 32];
     buf[..16].copy_from_slice(&hash[range]);
-    buf[31] &= 0x3f;
-    Fr::from_repr(buf).unwrap_or(Fr::zero())
+    Fr::from_repr(buf).expect("128-bit value is a canonical field element")
 }
 
 /// The three field inputs and the native commitment for a (program_id, hash) pair.

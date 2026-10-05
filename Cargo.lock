@@ -978,6 +978,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_core 0.6.4",
  "sha2 0.10.9",
+ "sha3 0.10.9",
  "standard-plonk-circuit",
 ]
 

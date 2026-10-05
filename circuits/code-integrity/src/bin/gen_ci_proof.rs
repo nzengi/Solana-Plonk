@@ -9,6 +9,11 @@
 use code_integrity_circuit::{fr_to_bytes_le, generate_ci_test_vector, CiTestVector};
 use std::path::PathBuf;
 
+fn keccak(b: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    Keccak256::digest(b).into()
+}
+
 fn arg(name: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned())
@@ -26,6 +31,10 @@ fn main() -> Result<(), anyhow::Error> {
     let v: CiTestVector = generate_ci_test_vector(k, srs.as_deref(), &program_id, &program_hash)?;
     let commitment = hex::encode(fr_to_bytes_le(&v.instances[3]));
     eprintln!("[2/4] vk={} B  proof={} B  commitment(LE)={}", v.vk_bytes.len(), v.proof_bytes.len(), commitment);
+    // Hashes the on-chain verifier binds to (keccak256, as compute_replay_hashes does).
+    let vk_keccak = hex::encode(keccak(&v.vk_bytes));
+    let proof_keccak = hex::encode(keccak(&v.proof_bytes));
+    eprintln!("       vk_keccak={vk_keccak}  proof_keccak={proof_keccak}");
     if let Some(exp) = arg("--expect-commitment") {
         anyhow::ensure!(exp.eq_ignore_ascii_case(&commitment), "commitment mismatch: expected {exp}, got {commitment}");
         eprintln!("       ✓ commitment equals PRUV's native compute_poseidon_commitment");
@@ -60,6 +69,9 @@ fn main() -> Result<(), anyhow::Error> {
             std::fs::write(&path, &buf)?;
             eprintln!("[+] wrote golden → {} ({} B)", path.display(), buf.len());
         }
+    }
+    if arg("--json").is_some() || std::env::args().any(|a| a == "--json") {
+        println!("{{\"vk_keccak\":\"{vk_keccak}\",\"proof_keccak\":\"{proof_keccak}\",\"commitment_le\":\"{commitment}\",\"proof_len\":{},\"vk_len\":{}}}", v.proof_bytes.len(), v.vk_bytes.len());
     }
     match result {
         Ok(true) => { eprintln!("✓ code-integrity proof verified end-to-end (host)"); Ok(()) }

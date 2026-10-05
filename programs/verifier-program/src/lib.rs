@@ -845,7 +845,8 @@ mod entry {
                     instruction_data[7], instruction_data[8],
                 ]);
                 let payer = *accounts[1].address().as_array();
-                let stage2_state: &[u8] = unsafe { accounts[0].borrow_unchecked() };
+                // Writable: on success stage 3 replaces Stage2Output with the VerifiedRecord.
+                let stage2_state: &mut [u8] = unsafe { accounts[0].borrow_unchecked_mut() };
                 return super::run_stage3(nonce, &payer, stage2_state)
                     .map_err(ProgramError::Custom);
             }
@@ -1026,7 +1027,7 @@ mod tests {
 
         run_stage1(nonce, &payer, &data, &mut stage1_state).expect("stage1");
         run_stage2a(nonce, &payer, &data, &stage1_state, &mut stage2_state).expect("stage2a");
-        run_stage3(nonce, &payer, &stage2_state).expect("stage3");
+        run_stage3(nonce, &payer, &mut stage2_state).expect("stage3");
     }
 
     /// Stage3 with a wrong payer (Eve) → STAGE_AUTH_MISMATCH. Stage1/stage2a
@@ -1047,7 +1048,7 @@ mod tests {
 
         run_stage1(nonce, &payer_alice, &data, &mut stage1_state).unwrap();
         run_stage2a(nonce, &payer_alice, &data, &stage1_state, &mut stage2_state).unwrap();
-        let err = run_stage3(nonce, &payer_eve, &stage2_state).unwrap_err();
+        let err = run_stage3(nonce, &payer_eve, &mut stage2_state).unwrap_err();
         assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
     }
 
@@ -1098,7 +1099,7 @@ mod tests {
 
         run_stage1(42, &payer, &data, &mut stage1_state).unwrap();
         run_stage2a(42, &payer, &data, &stage1_state, &mut stage2_state).unwrap();
-        let err = run_stage3(43, &payer, &stage2_state).unwrap_err();
+        let err = run_stage3(43, &payer, &mut stage2_state).unwrap_err();
         assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
     }
 

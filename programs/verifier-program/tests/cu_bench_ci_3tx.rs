@@ -188,7 +188,7 @@ fn code_integrity_3tx_split_inside_bpf_vm() {
     let stage3_ix = Instruction {
         program_id,
         accounts: vec![
-            AccountMeta::new_readonly(stage2_pk, false),
+            AccountMeta::new(stage2_pk, false), // stage 3 writes the VerifiedRecord here
             AccountMeta::new_readonly(signer_pk, true),
         ],
         data: stage3_data,
@@ -199,6 +199,12 @@ fn code_integrity_3tx_split_inside_bpf_vm() {
 
     let total = r1.compute_units_consumed + r2.compute_units_consumed + r3.compute_units_consumed;
     eprintln!("[ci 3-tx] TOTAL  CU = {}", total);
+
+    // Stage 3 must leave the VerifiedRecord (magic + vk/proof/instance hashes + payer).
+    let rec = r3.resulting_accounts.iter().find(|(p, _)| *p == stage2_pk).map(|(_, a)| a.data.clone()).expect("stage2 account");
+    assert_eq!(&rec[..8], b"HALO2OK1", "VerifiedRecord magic missing after stage 3");
+    assert_eq!(&rec[104..136], signer_pk.as_ref(), "VerifiedRecord payer");
+    eprintln!("[ci 3-tx] VerifiedRecord vk_hash={} proof_hash={}", hex_short(&rec[8..40]), hex_short(&rec[40..72]));
 
     // Per-stage soft caps. Fibonacci's stage2a is right at the 1.4 M edge
     // because shplonk's phase 1 (rotation-set Fr math, O(n²) lagrange
@@ -223,3 +229,5 @@ fn code_integrity_3tx_split_inside_bpf_vm() {
     }
     assert!(over_hard.is_empty(), "stages past 1.5 M hard ceiling: {over_hard:?}");
 }
+
+fn hex_short(b: &[u8]) -> String { b.iter().take(8).map(|x| format!("{x:02x}")).collect::<String>() + "…" }
