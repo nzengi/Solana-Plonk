@@ -14,6 +14,7 @@ members = [
     "circuits/bound-range-check",
     "circuits/external-sp",
     "circuits/multi-phase-check",
+    "circuits/code-integrity",
     "programs/verifier-program",
     "programs/g1-msm-bench",
     "programs/reward-pool",

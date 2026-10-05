@@ -239,6 +239,33 @@ fn reconstruct_instance_evals_helper(
     ).map_err(|_| errors::VERIFIER_ERROR)
 }
 
+/// Lagrange terms + instance evals at `x` with a single batched inversion
+/// (`evaluate_domain_batched`). Replaces `evaluate_lagrange` +
+/// `reconstruct_instance_evals_helper` on the hot path.
+#[inline(never)]
+fn domain_helper(
+    vk: &halo2_solana_verifier::plonk::PlonkProtocol,
+    x: ark_bn254::Fr,
+    public_inputs: &[[u8; 32]],
+) -> Result<(halo2_solana_verifier::plonk::lagrange::LagrangeEvaluations, alloc::vec::Vec<ark_bn254::Fr>), u32> {
+    let mut cols: alloc::vec::Vec<alloc::vec::Vec<ark_bn254::Fr>> = alloc::vec::Vec::new();
+    if vk.num_instance > 0 {
+        let mut col0 = alloc::vec::Vec::with_capacity(public_inputs.len());
+        for raw in public_inputs {
+            col0.push(halo2_solana_verifier::field::fr_from_bytes_be(raw)
+                .map_err(|_| errors::VERIFIER_ERROR)?);
+        }
+        cols.push(col0);
+        for _ in 1..vk.num_instance {
+            cols.push(alloc::vec::Vec::new());
+        }
+    }
+    let d = halo2_solana_verifier::plonk::lagrange::evaluate_domain_batched(
+        vk.k, vk.omega, x, vk.blinding_factors, &vk.instance_queries, &cols,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+    Ok((d.lag, d.instance_evals))
+}
+
 /// `ω^(n − blinding_factors − 1)` — used by `build_queries`. Lifted out
 /// of `run_traced` / `run_stage1` for the same stack-frame reason as above.
 #[inline(never)]
@@ -290,11 +317,8 @@ fn run_traced(
     ).map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after read_proof");
 
-    let lag = lagrange::evaluate_lagrange(vk.k, vk.omega, ch.x, vk.blinding_factors)
-        .map_err(|_| errors::VERIFIER_ERROR)?;
-    cu("[stage] after lagrange");
-
-    let instance_evals = reconstruct_instance_evals_helper(&vk, ch.x, &public_inputs)?;
+    let (lag, instance_evals) = domain_helper(&vk, ch.x, &public_inputs)?;
+    cu("[stage] after lagrange+instances (batched)");
     let expected_h_eval = v::compute_expected_h_eval(
         &vk, &proof, &ch, &lag, &instance_evals, &ch.user_challenges,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
@@ -368,9 +392,7 @@ pub fn run_stage1(
         &vk, proof_bytes, &public_inputs, &mut transcript,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
 
-    let lag = lagrange::evaluate_lagrange(vk.k, vk.omega, ch.x, vk.blinding_factors)
-        .map_err(|_| errors::VERIFIER_ERROR)?;
-    let instance_evals = reconstruct_instance_evals_helper(&vk, ch.x, &public_inputs)?;
+    let (lag, instance_evals) = domain_helper(&vk, ch.x, &public_inputs)?;
     let expected_h_eval = v::compute_expected_h_eval(
         &vk, &proof, &ch, &lag, &instance_evals, &ch.user_challenges,
     ).map_err(|_| errors::VERIFIER_ERROR)?;

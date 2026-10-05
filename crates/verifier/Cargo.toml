@@ -10,6 +10,7 @@ rust-version.workspace = true
 crate-type = ["lib"]
 
 [features]
+cu-trace = []
 default      = []
 # Use Solana alt_bn128 syscalls (BPF target). Off → fall back to arkworks-only host execution.
 solana-syscalls = ["dep:solana-program", "dep:solana-bn254"]
