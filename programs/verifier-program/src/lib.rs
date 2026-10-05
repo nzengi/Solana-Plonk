@@ -647,10 +647,18 @@ pub fn run_stage2a(
 /// performs auth checks, then runs the single G1 MSM (`finalize_shplonk_pairs`)
 /// and `alt_bn128_pairing`. No data account access — the KZG VK fields
 /// are already persisted inside `Stage2Output`.
+/// Record left in the stage-2 account after a successful stage 3, so that
+/// other programs (e.g. PRUV's attestation) can gate on "this proof, for this
+/// VK, with these public inputs, was verified on-chain" by reading an account
+/// owned by the verifier program:
+/// `"HALO2OK1" | vk_hash | proof_hash | instance_hash | payer`  (136 bytes)
+pub const VERIFIED_RECORD_MAGIC: &[u8; 8] = b"HALO2OK1";
+pub const VERIFIED_RECORD_LEN: usize = 8 + 32 * 4;
+
 pub fn run_stage3(
     nonce: u64,
     payer: &[u8; 32],
-    stage2_state_account: &[u8],
+    stage2_state_account: &mut [u8],
 ) -> Result<(), u32> {
     use halo2_solana_verifier::{
         kzg::{shplonk, KzgVk},
@@ -699,7 +707,29 @@ pub fn run_stage3(
     ).map_err(|_| errors::VERIFIER_ERROR)?;
 
     let ok = pairing::pairing_check(&pairs.0).map_err(|_| errors::VERIFIER_ERROR)?;
-    if ok { Ok(()) } else { Err(errors::VERIFIER_REJECTED) }
+    if !ok { return Err(errors::VERIFIER_REJECTED); }
+    // Replace the consumed Stage2Output with the VerifiedRecord.
+    let (vk_hash, proof_hash, instance_hash, payer_bytes) =
+        (stage2.vk_hash, stage2.proof_hash, stage2.instance_hash, stage2.payer);
+    write_verified_record(stage2_state_account, &vk_hash, &proof_hash, &instance_hash, &payer_bytes)
+}
+
+#[inline(never)]
+fn write_verified_record(
+    dst: &mut [u8],
+    vk_hash: &[u8; 32],
+    proof_hash: &[u8; 32],
+    instance_hash: &[u8; 32],
+    payer: &[u8; 32],
+) -> Result<(), u32> {
+    if dst.len() < VERIFIED_RECORD_LEN { return Err(errors::STAGE_PDA_TOO_SMALL); }
+    for b in dst.iter_mut() { *b = 0; }
+    dst[..8].copy_from_slice(VERIFIED_RECORD_MAGIC);
+    dst[8..40].copy_from_slice(vk_hash);
+    dst[40..72].copy_from_slice(proof_hash);
+    dst[72..104].copy_from_slice(instance_hash);
+    dst[104..136].copy_from_slice(payer);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
