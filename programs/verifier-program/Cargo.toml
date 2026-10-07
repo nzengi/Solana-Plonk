@@ -28,6 +28,7 @@ probe-read-proof = []
 # Run the FULL verify but with sol_log_compute_units_ checkpoints between
 # each stage. Produces a per-stage CU breakdown in the program log.
 stage-trace = []
+cu-trace = ["halo2-solana-verifier/cu-trace"]
 
 [dependencies]
 # `alloc` feature wires up the default allocator + panic handler used by

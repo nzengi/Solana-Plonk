@@ -961,6 +961,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
+name = "code-integrity-circuit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-bn254 0.4.0",
+ "ark-ff 0.4.2",
+ "bs58",
+ "halo2-solana-verifier",
+ "halo2-solana-vk-host",
+ "halo2_proofs",
+ "halo2curves",
+ "hex",
+ "light-poseidon 0.2.0",
+ "once_cell",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+ "standard-plonk-circuit",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

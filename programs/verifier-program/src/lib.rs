@@ -239,6 +239,33 @@ fn reconstruct_instance_evals_helper(
     ).map_err(|_| errors::VERIFIER_ERROR)
 }
 
+/// Lagrange terms + instance evals at `x` with a single batched inversion
+/// (`evaluate_domain_batched`). Replaces `evaluate_lagrange` +
+/// `reconstruct_instance_evals_helper` on the hot path.
+#[inline(never)]
+fn domain_helper(
+    vk: &halo2_solana_verifier::plonk::PlonkProtocol,
+    x: ark_bn254::Fr,
+    public_inputs: &[[u8; 32]],
+) -> Result<(halo2_solana_verifier::plonk::lagrange::LagrangeEvaluations, alloc::vec::Vec<ark_bn254::Fr>), u32> {
+    let mut cols: alloc::vec::Vec<alloc::vec::Vec<ark_bn254::Fr>> = alloc::vec::Vec::new();
+    if vk.num_instance > 0 {
+        let mut col0 = alloc::vec::Vec::with_capacity(public_inputs.len());
+        for raw in public_inputs {
+            col0.push(halo2_solana_verifier::field::fr_from_bytes_be(raw)
+                .map_err(|_| errors::VERIFIER_ERROR)?);
+        }
+        cols.push(col0);
+        for _ in 1..vk.num_instance {
+            cols.push(alloc::vec::Vec::new());
+        }
+    }
+    let d = halo2_solana_verifier::plonk::lagrange::evaluate_domain_batched(
+        vk.k, vk.omega, x, vk.blinding_factors, &vk.instance_queries, &cols,
+    ).map_err(|_| errors::VERIFIER_ERROR)?;
+    Ok((d.lag, d.instance_evals))
+}
+
 /// `ω^(n − blinding_factors − 1)` — used by `build_queries`. Lifted out
 /// of `run_traced` / `run_stage1` for the same stack-frame reason as above.
 #[inline(never)]
@@ -290,11 +317,8 @@ fn run_traced(
     ).map_err(|_| errors::VERIFIER_ERROR)?;
     cu("[stage] after read_proof");
 
-    let lag = lagrange::evaluate_lagrange(vk.k, vk.omega, ch.x, vk.blinding_factors)
-        .map_err(|_| errors::VERIFIER_ERROR)?;
-    cu("[stage] after lagrange");
-
-    let instance_evals = reconstruct_instance_evals_helper(&vk, ch.x, &public_inputs)?;
+    let (lag, instance_evals) = domain_helper(&vk, ch.x, &public_inputs)?;
+    cu("[stage] after lagrange+instances (batched)");
     let expected_h_eval = v::compute_expected_h_eval(
         &vk, &proof, &ch, &lag, &instance_evals, &ch.user_challenges,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
@@ -368,9 +392,7 @@ pub fn run_stage1(
         &vk, proof_bytes, &public_inputs, &mut transcript,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
 
-    let lag = lagrange::evaluate_lagrange(vk.k, vk.omega, ch.x, vk.blinding_factors)
-        .map_err(|_| errors::VERIFIER_ERROR)?;
-    let instance_evals = reconstruct_instance_evals_helper(&vk, ch.x, &public_inputs)?;
+    let (lag, instance_evals) = domain_helper(&vk, ch.x, &public_inputs)?;
     let expected_h_eval = v::compute_expected_h_eval(
         &vk, &proof, &ch, &lag, &instance_evals, &ch.user_challenges,
     ).map_err(|_| errors::VERIFIER_ERROR)?;
@@ -625,10 +647,18 @@ pub fn run_stage2a(
 /// performs auth checks, then runs the single G1 MSM (`finalize_shplonk_pairs`)
 /// and `alt_bn128_pairing`. No data account access — the KZG VK fields
 /// are already persisted inside `Stage2Output`.
+/// Record left in the stage-2 account after a successful stage 3, so that
+/// other programs (e.g. PRUV's attestation) can gate on "this proof, for this
+/// VK, with these public inputs, was verified on-chain" by reading an account
+/// owned by the verifier program:
+/// `"HALO2OK1" | vk_hash | proof_hash | instance_hash | payer`  (136 bytes)
+pub const VERIFIED_RECORD_MAGIC: &[u8; 8] = b"HALO2OK1";
+pub const VERIFIED_RECORD_LEN: usize = 8 + 32 * 4;
+
 pub fn run_stage3(
     nonce: u64,
     payer: &[u8; 32],
-    stage2_state_account: &[u8],
+    stage2_state_account: &mut [u8],
 ) -> Result<(), u32> {
     use halo2_solana_verifier::{
         kzg::{shplonk, KzgVk},
@@ -677,7 +707,29 @@ pub fn run_stage3(
     ).map_err(|_| errors::VERIFIER_ERROR)?;
 
     let ok = pairing::pairing_check(&pairs.0).map_err(|_| errors::VERIFIER_ERROR)?;
-    if ok { Ok(()) } else { Err(errors::VERIFIER_REJECTED) }
+    if !ok { return Err(errors::VERIFIER_REJECTED); }
+    // Replace the consumed Stage2Output with the VerifiedRecord.
+    let (vk_hash, proof_hash, instance_hash, payer_bytes) =
+        (stage2.vk_hash, stage2.proof_hash, stage2.instance_hash, stage2.payer);
+    write_verified_record(stage2_state_account, &vk_hash, &proof_hash, &instance_hash, &payer_bytes)
+}
+
+#[inline(never)]
+fn write_verified_record(
+    dst: &mut [u8],
+    vk_hash: &[u8; 32],
+    proof_hash: &[u8; 32],
+    instance_hash: &[u8; 32],
+    payer: &[u8; 32],
+) -> Result<(), u32> {
+    if dst.len() < VERIFIED_RECORD_LEN { return Err(errors::STAGE_PDA_TOO_SMALL); }
+    for b in dst.iter_mut() { *b = 0; }
+    dst[..8].copy_from_slice(VERIFIED_RECORD_MAGIC);
+    dst[8..40].copy_from_slice(vk_hash);
+    dst[40..72].copy_from_slice(proof_hash);
+    dst[72..104].copy_from_slice(instance_hash);
+    dst[104..136].copy_from_slice(payer);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -823,7 +875,8 @@ mod entry {
                     instruction_data[7], instruction_data[8],
                 ]);
                 let payer = *accounts[1].address().as_array();
-                let stage2_state: &[u8] = unsafe { accounts[0].borrow_unchecked() };
+                // Writable: on success stage 3 replaces Stage2Output with the VerifiedRecord.
+                let stage2_state: &mut [u8] = unsafe { accounts[0].borrow_unchecked_mut() };
                 return super::run_stage3(nonce, &payer, stage2_state)
                     .map_err(ProgramError::Custom);
             }
@@ -1004,7 +1057,7 @@ mod tests {
 
         run_stage1(nonce, &payer, &data, &mut stage1_state).expect("stage1");
         run_stage2a(nonce, &payer, &data, &stage1_state, &mut stage2_state).expect("stage2a");
-        run_stage3(nonce, &payer, &stage2_state).expect("stage3");
+        run_stage3(nonce, &payer, &mut stage2_state).expect("stage3");
     }
 
     /// Stage3 with a wrong payer (Eve) → STAGE_AUTH_MISMATCH. Stage1/stage2a
@@ -1025,7 +1078,7 @@ mod tests {
 
         run_stage1(nonce, &payer_alice, &data, &mut stage1_state).unwrap();
         run_stage2a(nonce, &payer_alice, &data, &stage1_state, &mut stage2_state).unwrap();
-        let err = run_stage3(nonce, &payer_eve, &stage2_state).unwrap_err();
+        let err = run_stage3(nonce, &payer_eve, &mut stage2_state).unwrap_err();
         assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
     }
 
@@ -1076,7 +1129,7 @@ mod tests {
 
         run_stage1(42, &payer, &data, &mut stage1_state).unwrap();
         run_stage2a(42, &payer, &data, &stage1_state, &mut stage2_state).unwrap();
-        let err = run_stage3(43, &payer, &stage2_state).unwrap_err();
+        let err = run_stage3(43, &payer, &mut stage2_state).unwrap_err();
         assert_eq!(err, errors::STAGE_AUTH_MISMATCH);
     }
 

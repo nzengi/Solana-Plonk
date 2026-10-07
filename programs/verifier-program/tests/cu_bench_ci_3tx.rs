@@ -28,10 +28,10 @@ const DATA_ACCT_LAMPORTS: u64 = 100_000_000;
 /// into its components.
 fn load_fib_golden() -> (Vec<u8>, Vec<u8>, [u8; 64], [u8; 128], [u8; 128], Vec<[u8; 32]>) {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("../../circuits/fibonacci/tests/golden_v15_fib.bin");
+    path.push("../../circuits/code-integrity/tests/golden_ci.bin");
     let buf = std::fs::read(&path).unwrap_or_else(|_| panic!(
         "missing {path:?} — run \
-         `cargo run -p fibonacci-circuit --bin gen-fib-proof -- --write-golden` first"
+         `cargo run -p code-integrity-circuit --bin gen-ci-proof -- --write-golden` first"
     ));
     let mut cur = 0;
     assert_eq!(&buf[cur..cur + 8], b"GLDN0002");
@@ -91,7 +91,7 @@ fn build_data_payload(
 }
 
 #[test]
-fn fibonacci_3tx_split_inside_bpf_vm() {
+fn code_integrity_3tx_split_inside_bpf_vm() {
     let (vk, proof, g1_one, g2_one, g2_tau, pis) = load_fib_golden();
     let payload = build_data_payload(&vk, &proof, &g1_one, &g2_one, &g2_tau, &pis);
     let nonce: u64 = 0x4242_4242_4242_4242;
@@ -143,7 +143,7 @@ fn fibonacci_3tx_split_inside_bpf_vm() {
         (signer_pk, signer_acc.clone()),
     ];
     let r1 = mollusk.process_instruction(&stage1_ix, &accs_after_stage0);
-    eprintln!("[fib 3-tx] STAGE1  CU = {} | {:?}", r1.compute_units_consumed, r1.program_result);
+    eprintln!("[ci 3-tx] STAGE1  CU = {} | {:?}", r1.compute_units_consumed, r1.program_result);
     assert!(matches!(r1.program_result, ProgramResult::Success), "STAGE1 failed: {:?}", r1.program_result);
 
     // Thread accounts forward — replace the entries Mollusk returned.
@@ -169,7 +169,7 @@ fn fibonacci_3tx_split_inside_bpf_vm() {
         data: stage2a_data,
     };
     let r2 = mollusk.process_instruction(&stage2a_ix, &accs_after_stage1);
-    eprintln!("[fib 3-tx] STAGE2A CU = {} | {:?}", r2.compute_units_consumed, r2.program_result);
+    eprintln!("[ci 3-tx] STAGE2A CU = {} | {:?}", r2.compute_units_consumed, r2.program_result);
     assert!(matches!(r2.program_result, ProgramResult::Success), "STAGE2A failed: {:?}", r2.program_result);
 
     let mut accs_after_stage2a = accs_after_stage1.clone();
@@ -188,17 +188,23 @@ fn fibonacci_3tx_split_inside_bpf_vm() {
     let stage3_ix = Instruction {
         program_id,
         accounts: vec![
-            AccountMeta::new(stage2_pk, false),
+            AccountMeta::new(stage2_pk, false), // stage 3 writes the VerifiedRecord here
             AccountMeta::new_readonly(signer_pk, true),
         ],
         data: stage3_data,
     };
     let r3 = mollusk.process_instruction(&stage3_ix, &accs_after_stage2a);
-    eprintln!("[fib 3-tx] STAGE3  CU = {} | {:?}", r3.compute_units_consumed, r3.program_result);
+    eprintln!("[ci 3-tx] STAGE3  CU = {} | {:?}", r3.compute_units_consumed, r3.program_result);
     assert!(matches!(r3.program_result, ProgramResult::Success), "STAGE3 failed: {:?}", r3.program_result);
 
     let total = r1.compute_units_consumed + r2.compute_units_consumed + r3.compute_units_consumed;
-    eprintln!("[fib 3-tx] TOTAL  CU = {}", total);
+    eprintln!("[ci 3-tx] TOTAL  CU = {}", total);
+
+    // Stage 3 must leave the VerifiedRecord (magic + vk/proof/instance hashes + payer).
+    let rec = r3.resulting_accounts.iter().find(|(p, _)| *p == stage2_pk).map(|(_, a)| a.data.clone()).expect("stage2 account");
+    assert_eq!(&rec[..8], b"HALO2OK1", "VerifiedRecord magic missing after stage 3");
+    assert_eq!(&rec[104..136], signer_pk.as_ref(), "VerifiedRecord payer");
+    eprintln!("[ci 3-tx] VerifiedRecord vk_hash={} proof_hash={}", hex_short(&rec[8..40]), hex_short(&rec[40..72]));
 
     // Per-stage soft caps. Fibonacci's stage2a is right at the 1.4 M edge
     // because shplonk's phase 1 (rotation-set Fr math, O(n²) lagrange
@@ -219,7 +225,9 @@ fn fibonacci_3tx_split_inside_bpf_vm() {
         }
     }
     if !at_edge.is_empty() {
-        eprintln!("[fib 3-tx] WARN stages at/over 1.4 M default cap: {at_edge:?}");
+        eprintln!("[ci 3-tx] WARN stages at/over 1.4 M default cap: {at_edge:?}");
     }
     assert!(over_hard.is_empty(), "stages past 1.5 M hard ceiling: {over_hard:?}");
 }
+
+fn hex_short(b: &[u8]) -> String { b.iter().take(8).map(|x| format!("{x:02x}")).collect::<String>() + "…" }

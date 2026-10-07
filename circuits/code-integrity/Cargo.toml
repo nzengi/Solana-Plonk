@@ -1,0 +1,39 @@
+[package]
+name        = "code-integrity-circuit"
+version     = "0.1.0"
+description = "PRUV code-integrity circuit (two constrained Poseidon permutations) ported to halo2 v0.3.0 for native on-chain verification"
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gen-ci-proof"
+path = "src/bin/gen_ci_proof.rs"
+
+[lib]
+name = "code_integrity_circuit"
+path = "src/lib.rs"
+
+[dependencies]
+halo2_proofs  = { workspace = true }
+halo2curves   = { workspace = true }
+
+halo2-solana-vk-host  = { path = "../../crates/vk-host" }
+halo2-solana-verifier = { path = "../../crates/verifier", features = ["std", "solana-syscalls"] }
+standard-plonk-circuit = { path = "../standard-plonk" }   # Keccak-BE transcript
+
+# Circom-compatible Poseidon constants (same crate PRUV's circuits and the
+# sol_poseidon syscall are built on). light-poseidon 0.2 sits on arkworks 0.4,
+# which coexists with the workspace's arkworks 0.5.
+light-poseidon = "0.2"
+ark-bn254-04   = { package = "ark-bn254", version = "0.4" }
+ark-ff-04      = { package = "ark-ff", version = "0.4" }
+
+once_cell = "1"
+sha2      = "0.10"
+sha3      = "0.10"
+hex       = "0.4"
+bs58      = "0.5"
+rand      = "0.8"
+rand_core = "0.6"
+anyhow    = "1"

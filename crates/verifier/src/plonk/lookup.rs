@@ -182,7 +182,7 @@ mod tests {
             l_0:     Fr::from(2u64),
             l_last:  Fr::from(3u64),
             l_blind: Fr::from(0u64),
-            xn:      Fr::from(5u64),
+            xn:      Fr::from(5u64), xn_inv: Fr::ONE,
         }
     }
 

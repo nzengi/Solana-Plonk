@@ -1,5 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+// `cu-trace` (profiling only) needs two extern syscalls; everything else stays unsafe-free.
+#![cfg_attr(not(feature = "cu-trace"), forbid(unsafe_code))]
+#![cfg_attr(feature = "cu-trace", deny(unsafe_code))]
 
 //! halo2-solana-verifier
 //!
@@ -38,6 +40,24 @@ pub use plonk::proof_reader;
 
 pub mod vk;
 pub mod proof;
+/// Compute-unit trace points (feature `cu-trace`, BPF only): logs a label and
+/// the remaining compute units so a Mollusk run can be profiled line by line.
+#[cfg_attr(feature = "cu-trace", allow(unsafe_code))]
+pub mod cutrace {
+    #[cfg(all(feature = "cu-trace", target_os = "solana"))]
+    extern "C" {
+        fn sol_log_(message: *const u8, len: u64);
+        fn sol_log_compute_units_();
+    }
+    #[inline(always)]
+    pub fn point(_label: &str) {
+        #[cfg(all(feature = "cu-trace", target_os = "solana"))]
+        unsafe {
+            sol_log_(_label.as_ptr(), _label.len() as u64);
+            sol_log_compute_units_();
+        }
+    }
+}
 pub mod stage_state;
 
 pub use error::Error;

@@ -29,6 +29,117 @@ pub struct LagrangeEvaluations {
     pub l_blind: Fr,
     /// `xⁿ` — also returned because the gate identity needs `xⁿ − 1`.
     pub xn: Fr,
+    /// `(xⁿ − 1)⁻¹`, so `compute_expected_h_eval` does not invert again.
+    pub xn_inv: Fr,
+}
+
+/// Everything the verifier needs from the evaluation domain at `x`, computed
+/// with a **single** field inversion (Montgomery batch trick) instead of one
+/// Fermat inversion per Lagrange term and per public input. On BPF one
+/// inversion costs ~55k CU, so for a circuit with blinding `b` and `m` public
+/// inputs this saves roughly `(b + m + 5) × 55k` CU in stage 1.
+pub struct DomainAtX {
+    pub lag: LagrangeEvaluations,
+    /// One evaluation per `instance_queries` entry (same order).
+    pub instance_evals: alloc::vec::Vec<Fr>,
+}
+
+#[inline(never)]
+pub fn evaluate_domain_batched(
+    k: u32,
+    omega: Fr,
+    x: Fr,
+    blinding_factors: usize,
+    instance_queries: &[(u32, i32)],
+    public_inputs: &[alloc::vec::Vec<Fr>],
+) -> Result<DomainAtX, Error> {
+    use alloc::vec::Vec;
+    // Every step lives in its own `#[inline(never)]` frame: the SBF stack
+    // budget is 4096 bytes per frame and Fr temporaries are 32 bytes each.
+    let n_u64: u64 = 1u64 << k;
+    let xn = pow_u64(x, n_u64);
+    let omega_inv = pow_u64(omega, n_u64 - 1); // ω⁻¹ = ω^(n−1), no inversion
+    let b = blinding_factors;
+
+    // Denominators, in a fixed order:
+    //   [0] n   [1] x − 1   [2] xⁿ − 1
+    //   [3 .. 3+b+1)        x − ω⁻ⁱ for i = 1 ..= b+1   (l_blind terms, then l_last)
+    //   [3+b+1 ..)          x − ω^(j − rot) for every (query, public-input row)
+    let mut dens: Vec<Fr> = Vec::with_capacity(4 + b + 8);
+    dens.push(Fr::from(n_u64));
+    dens.push(x - Fr::ONE);
+    dens.push(xn - Fr::ONE);
+    let neg_pows = push_blind_denominators(&mut dens, omega_inv, x, b);
+    let inst_terms = push_instance_denominators(&mut dens, omega, omega_inv, x, instance_queries, public_inputs)?;
+    crate::kzg::shplonk::batch_inverse_fr(&mut dens)
+        .map_err(|_| Error::Protocol("evaluate_domain: x lies on the domain"))?;
+
+    let factor = (xn - Fr::ONE) * dens[0]; // (xⁿ − 1) · n⁻¹
+    let lag = assemble_lagrange(&dens, &neg_pows, b, factor, xn);
+    let instance_evals = assemble_instances(&dens, 3 + b + 1, &inst_terms, factor, instance_queries.len());
+    Ok(DomainAtX { lag, instance_evals })
+}
+
+/// Pushes `x − ω⁻ⁱ` for i = 1 ..= b+1 and returns the `ω⁻ⁱ` powers.
+#[inline(never)]
+fn push_blind_denominators(dens: &mut alloc::vec::Vec<Fr>, omega_inv: Fr, x: Fr, b: usize) -> alloc::vec::Vec<Fr> {
+    let mut neg_pows = alloc::vec::Vec::with_capacity(b + 1);
+    let mut w = Fr::ONE;
+    for _ in 1..=(b + 1) {
+        w *= omega_inv;
+        neg_pows.push(w);
+        dens.push(x - w);
+    }
+    neg_pows
+}
+
+/// Pushes `x − ω^(j − rot)` per (query, row) and returns `(query index, value, ω^(j − rot))`.
+#[inline(never)]
+fn push_instance_denominators(
+    dens: &mut alloc::vec::Vec<Fr>,
+    omega: Fr,
+    omega_inv: Fr,
+    x: Fr,
+    instance_queries: &[(u32, i32)],
+    public_inputs: &[alloc::vec::Vec<Fr>],
+) -> Result<alloc::vec::Vec<(usize, Fr, Fr)>, Error> {
+    let mut terms = alloc::vec::Vec::new();
+    for (qi, (col_index, rotation)) in instance_queries.iter().enumerate() {
+        let column_values = public_inputs.get(*col_index as usize)
+            .ok_or(Error::Protocol("evaluate_domain: instance column out of range"))?;
+        for (j, value) in column_values.iter().enumerate() {
+            let e = j as i64 - *rotation as i64;
+            let wp = if e >= 0 { pow_u64(omega, e as u64) } else { pow_u64(omega_inv, (-e) as u64) };
+            dens.push(x - wp);
+            terms.push((qi, *value, wp));
+        }
+    }
+    Ok(terms)
+}
+
+#[inline(never)]
+fn assemble_lagrange(dens: &[Fr], neg_pows: &[Fr], b: usize, factor: Fr, xn: Fr) -> LagrangeEvaluations {
+    let l_0 = factor * dens[1];
+    let xn_inv = dens[2];
+    let mut l_blind = Fr::ZERO;
+    for i in 0..b {
+        let t = neg_pows[i] * factor;
+        l_blind += t * dens[3 + i];
+    }
+    let t = neg_pows[b] * factor;
+    let l_last = t * dens[3 + b];
+    LagrangeEvaluations { l_0, l_last, l_blind, xn, xn_inv }
+}
+
+#[inline(never)]
+fn assemble_instances(dens: &[Fr], base: usize, terms: &[(usize, Fr, Fr)], factor: Fr, num_queries: usize) -> alloc::vec::Vec<Fr> {
+    let mut out: alloc::vec::Vec<Fr> = alloc::vec![Fr::ZERO; num_queries];
+    for (idx, (qi, value, wp)) in terms.iter().enumerate() {
+        let basis = *wp * factor;
+        let basis = basis * dens[base + idx];
+        out[*qi] += *value * basis;
+    }
+    out
 }
 
 /// Compute `L_0(x)`, `L_last(x)`, `L_blind(x)` and `xⁿ` from circuit metadata.
@@ -74,7 +185,9 @@ pub fn evaluate_lagrange(
         .ok_or(Error::Protocol("evaluate_lagrange: x = ω⁻(blinding+1) (l_last)"))?;
     let l_last = omega_inv_pow_last * factor * denom_last;
 
-    Ok(LagrangeEvaluations { l_0, l_last, l_blind, xn })
+    let xn_inv = xn_minus_one.inverse()
+        .ok_or(Error::Protocol("evaluate_lagrange: xn − 1 = 0 (x on subgroup)"))?;
+    Ok(LagrangeEvaluations { l_0, l_last, l_blind, xn, xn_inv })
 }
 
 /// Accumulates `Σᵢ ω⁻ⁱ · factor · (x − ω⁻ⁱ)⁻¹` for i ∈ [1, blinding_factors].

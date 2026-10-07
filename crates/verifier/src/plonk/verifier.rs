@@ -73,10 +73,14 @@ pub fn compute_expected_h_eval(
     user_challenges: &[Fr],
 ) -> Result<Fr, Error> {
     let mut expressions: Vec<Fr> = Vec::new();
+    crate::cutrace::point("[cu] h_eval: start");
     expressions.extend(evaluate_gates(vk, proof, instance_evals, user_challenges)?);
+    crate::cutrace::point("[cu] h_eval: after gates");
     expressions.extend(permutation::expressions(vk, proof, ch, lag, instance_evals)?);
+    crate::cutrace::point("[cu] h_eval: after permutation");
     expressions.extend(lookup::expressions(vk, proof, ch, lag, instance_evals, user_challenges)?);
     expressions.extend(shuffle::expressions(vk, proof, ch, lag, instance_evals, user_challenges)?);
+    crate::cutrace::point("[cu] h_eval: after lookup/shuffle");
 
     #[cfg(feature = "debug-trace")] {
         for (i, e) in expressions.iter().enumerate() {
@@ -86,9 +90,8 @@ pub fn compute_expected_h_eval(
 
     // Halo2's forward Horner fold: first expression gets highest y power.
     let folded = expressions.iter().fold(Fr::ZERO, |acc, e| acc * ch.y + e);
-    let xn_inv = (lag.xn - Fr::ONE).inverse()
-        .ok_or(Error::Protocol("verify: xn − 1 = 0 (x on subgroup)"))?;
-    let expected = folded * xn_inv;
+    crate::cutrace::point("[cu] h_eval: after fold");
+    let expected = folded * lag.xn_inv;
 
     #[cfg(feature = "debug-trace")] {
         eprintln!("[verifier] folded          = {}", _fr_hex(&folded));
@@ -341,15 +344,8 @@ pub fn verify(
         eprintln!("[verifier] random_poly_eval = {}", _fr_hex(&proof.random_poly_eval));
     }
 
-    // 3. Compute Lagrange evaluations at x.
-    let lag = lagrange::evaluate_lagrange(vk.k, vk.omega, ch.x, vk.blinding_factors)?;
+    // 3+4. Lagrange evaluations and instance evals at x — one batched inversion.
 
-    #[cfg(feature = "debug-trace")] {
-        eprintln!("[verifier] xn      = {}", _fr_hex(&lag.xn));
-        eprintln!("[verifier] l_0     = {}", _fr_hex(&lag.l_0));
-        eprintln!("[verifier] l_last  = {}", _fr_hex(&lag.l_last));
-        eprintln!("[verifier] l_blind = {}", _fr_hex(&lag.l_blind));
-    }
 
     // 4. Reconstruct instance evals at challenge x via Lagrange basis (halo2's
     //    `QUERY_INSTANCE = false` path). Public inputs are the per-column
@@ -372,8 +368,8 @@ pub fn verify(
         }
         cols
     };
-    let instance_evals = lagrange::reconstruct_instance_evals(
-        vk.k, vk.omega, ch.x, &vk.instance_queries, &public_inputs_per_column,
+    let lagrange::DomainAtX { lag, instance_evals } = lagrange::evaluate_domain_batched(
+        vk.k, vk.omega, ch.x, vk.blinding_factors, &vk.instance_queries, &public_inputs_per_column,
     )?;
 
     // v2.0: user-defined phase challenges are squeezed in `read_proof` and

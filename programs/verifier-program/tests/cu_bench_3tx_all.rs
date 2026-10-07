@@ -147,7 +147,7 @@ fn run_3tx(label: &str, payload: Vec<u8>) -> (u64, u64, u64) {
     let stage3_ix = Instruction {
         program_id,
         accounts: vec![
-            AccountMeta::new_readonly(stage2_pk, false),
+            AccountMeta::new(stage2_pk, false),
             AccountMeta::new_readonly(signer_pk, true),
         ],
         data: stage3_data,

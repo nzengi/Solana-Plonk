@@ -279,6 +279,8 @@ impl Stage1Output {
             l_last: self.l_last,
             l_blind: self.l_blind,
             xn: self.xn,
+            // Only needed if the h identity is re-evaluated after stage 1 (it is not); recomputed lazily.
+            xn_inv: ark_ff::Field::inverse(&(self.xn - ark_bn254::Fr::from(1u64))).unwrap_or(ark_bn254::Fr::from(0u64)),
         }
     }
 }
